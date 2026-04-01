@@ -1,0 +1,129 @@
+# ─────────────────────────────────────────────────────────
+# Python & Virtual Environment
+# ─────────────────────────────────────────────────────────
+myenv/
+venv/
+env/
+.env
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+*.egg-info/
+dist/
+build/
+*.egg
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ─────────────────────────────────────────────────────────
+# IDE & Editor
+# ─────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+*.sublime-project
+*.sublime-workspace
+
+# ─────────────────────────────────────────────────────────
+# Jupyter & Notebooks
+# ─────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+.jupyter/
+
+# ─────────────────────────────────────────────────────────
+# Sensitive Data & Credentials
+# ─────────────────────────────────────────────────────────
+.secrets/
+.credentials
+*.pem
+*.key
+*.pub
+config.local.py
+.env.local
+.env.*.local
+
+# ─────────────────────────────────────────────────────────
+# Temporary & Cache Files
+# ─────────────────────────────────────────────────────────
+*.tmp
+*.temp
+*.log
+*.bak
+*.backup
+.cache/
+*.cache
+tmp/
+temp/
+
+# ─────────────────────────────────────────────────────────
+# Image & Processing Artifacts
+# ─────────────────────────────────────────────────────────
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.bmp
+*.tiff
+images/processed/
+images/temp/
+uploads/
+temp_images/
+
+# ─────────────────────────────────────────────────────────
+# Test & Coverage
+# ─────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+*.cover
+.hypothesis/
+
+# ─────────────────────────────────────────────────────────
+# Database & Data
+# ─────────────────────────────────────────────────────────
+*.db
+*.sqlite
+*.sqlite3
+*.csv
+data/
+*.pkl
+*.pickle
+
+# ─────────────────────────────────────────────────────────
+# OS-specific
+# ─────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+$RECYCLE.BIN/
+desktop.ini
+
+# ─────────────────────────────────────────────────────────
+# Node modules (if using frontend tools)
+# ─────────────────────────────────────────────────────────
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# ─────────────────────────────────────────────────────────
+# Emissions tracking
+# ─────────────────────────────────────────────────────────
+emissions.csv
+.codecarbon/
+
+# ─────────────────────────────────────────────────────────
+# Flask app runtime
+# ─────────────────────────────────────────────────────────
+instance/
+.webassets-cache

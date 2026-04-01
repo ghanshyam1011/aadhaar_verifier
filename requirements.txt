@@ -1,0 +1,64 @@
+# ============================================================
+#  Aadhaar OCR v5 — Requirements
+#  Install: pip install -r requirements.txt
+#
+#  SYSTEM DEPENDENCIES (install separately):
+#    Ubuntu/Debian:
+#      sudo apt install tesseract-ocr tesseract-ocr-hin libzbar0
+#    Mac:
+#      brew install tesseract tesseract-lang zbar
+#    Windows:
+#      Tesseract: https://github.com/UB-Mannheim/tesseract/wiki
+#      zbar:      bundled with pyzbar wheel on Windows
+# ============================================================
+
+
+# ── CORE (required) ──────────────────────────────────────────
+
+opencv-python
+numpy
+Pillow
+pytesseract
+
+
+# ── LLM CORRECTION (Groq API) ────────────────────────────────
+
+openai
+# Usage: export GROQ_API_KEY=gsk_...
+# Free key at: https://console.groq.com
+
+
+# ── QR CODE DETECTION ────────────────────────────────────────
+
+pyzbar
+# Ubuntu: sudo apt install libzbar0
+# Falls back to OpenCV QRCodeDetector if not installed
+
+
+# ── FACE AI — DEEP LEARNING MATCH ────────────────────────────
+
+deepface
+tensorflow
+# Downloads ~500MB VGG-Face model on first run (cached)
+# Falls back to OpenCV LBPH if not installed
+
+
+# ── OCR ENGINE 2 — PaddleOCR ─────────────────────────────────
+
+paddlepaddle
+paddleocr
+
+
+# ── OCR ENGINE 3 — TrOCR + Local LLM Fallback ────────────────
+
+transformers
+torch
+sentencepiece
+
+
+# ── SUPER RESOLUTION (optional) ──────────────────────────────
+
+# realesrgan
+# basicsr
+# Uncomment to enable Real-ESRGAN upscaling for blurry images
+# Download weights: https://github.com/xinntao/Real-ESRGAN/releases
