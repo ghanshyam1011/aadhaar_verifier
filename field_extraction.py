@@ -354,9 +354,6 @@ def extract_issue_date(text):
     m = re.search(r'Issue\s*Date[:\s]+(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{4})', text, re.IGNORECASE)
     if m:
         return m.group(1)
-    # Sometimes on the side: "Issue Date: 13/12/2011"
-    m = re.search(r'(\d{2}[\/\-]\d{2}[\/\-]\d{4})', text)
-    # Only return if it's before the main DOB (issue dates are usually earlier)
     return None
 
 def extract_mobile(text):
@@ -771,4 +768,3 @@ def step14_extract(combined_text):
         print(f"{marker}  {k:<28}: {display}")
 
     return fields
-

@@ -9,6 +9,7 @@ import re
 from collections import Counter
 from utils import extract_dob_tuples
 from utils import section, ok, info, warn, err
+from utils import fix_digit_string, DIGIT_FIX
 
 # llm_correct_fields is imported lazily inside each function below
 # to avoid a circular import at load time (ocr_correction → llm_correction → ocr_engines → preprocessing)
@@ -55,18 +56,6 @@ from utils import section, ok, info, warn, err
 #       - This cancels out random OCR noise
 # ─────────────────────────────────────────────────────────────
 
-# Character confusion map for digits (in digit-only strings)
-DIGIT_FIX = str.maketrans({
-    'O': '0', 'o': '0', 'D': '0', 'Q': '0',
-    'I': '1', 'l': '1', 'i': '1', '|': '1',
-    'Z': '2', 'z': '2',
-    'S': '5', 's': '5',
-    'G': '6', 'b': '6',
-    'T': '7',
-    'B': '8',
-    'g': '9', 'q': '9',
-})
-
 # Character confusion map for name letters
 NAME_CHAR_FIX = {
     '0': 'O', '1': 'I', '3': 'E', '4': 'A',
@@ -93,13 +82,6 @@ NAME_WORD_FIXES = [
     (r'([A-Z]{3,})VAN$', lambda m: m.group(1) + 'YAM'),
     (r'([A-Z]{3,})AN$',  lambda m: m.group(1) + 'AM'),
 ]
-
-def fix_digit_string(s):
-    """
-    Fix OCR errors in a string that should be all digits.
-    Replaces visually similar letters with their digit equivalents.
-    """
-    return s.translate(DIGIT_FIX)
 
 def fix_name_chars(word):
     """

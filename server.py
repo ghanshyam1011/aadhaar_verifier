@@ -6,7 +6,7 @@ import os
 # Import your OCR pipeline
 from main import run_pipeline
 
-app = Flask(__name__, static_folder="frontend", template_folder="frontend")
+app = Flask(__name__, static_folder=".", template_folder=".")
 CORS(app)   # allow frontend connection
 
 

@@ -630,9 +630,8 @@ def step19_face_pipeline(img_bgr, image_path, selfie_path=None):
         return face_result
 
     # Save face crop to outputs folder for inspection
-    face_out_path = '/mnt/user-data/outputs/aadhaar_face_crop.jpg'
+    face_out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "aadhaar_face_crop.jpg")
     try:
-        os.makedirs('/mnt/user-data/outputs', exist_ok=True)
         cv2.imwrite(face_out_path, face_img)
         ok(f"Face crop saved: {face_out_path}")
     except Exception:
@@ -659,5 +658,3 @@ def step19_face_pipeline(img_bgr, image_path, selfie_path=None):
         info("To enable: run with --selfie path/to/selfie.jpg")
 
     return face_result
-
-

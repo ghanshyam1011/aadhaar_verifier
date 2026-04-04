@@ -147,122 +147,6 @@ def run_tesseract_passes(binary, original_color):
 
 
 
-def run_trocr(image_input):
-    """
-    Engine 3 — TrOCR (Transformer OCR by Microsoft)
-
-    WHY TrOCR IS BETTER THAN PADDLEOCR ON BLURRY IMAGES:
-      PaddleOCR uses CRNN (CNN + RNN) for recognition.
-      TrOCR uses a Vision Transformer encoder + language model
-      decoder. This means it has prior knowledge of how real
-      words/numbers SHOULD look — so even when pixels are
-      merged by blur, it can infer the correct characters.
-
-      On severely blurry images (Laplacian score < 30):
-        PaddleOCR : often reads "D0B: 10/1?/200?" — gives up
-        TrOCR     : reads "DOB: 10/11/2005" — infers from context
-
-      This is because the decoder is a language model that
-      has seen millions of document images during training.
-
-    MODEL:
-      microsoft/trocr-base-printed  — best for printed ID cards
-      microsoft/trocr-large-printed — more accurate, slower
-
-    INSTALL:
-      pip install transformers torch pillow
-
-    STRATEGY:
-      TrOCR works on image patches, not full images.
-      We crop the image into horizontal bands (each field)
-      and run TrOCR on each band independently.
-      This matches how the model was trained.
-
-    RETURNS: (text: str, available: bool)
-    """
-    try:
-        from transformers import TrOCRProcessor, VisionEncoderDecoderModel
-        from PIL import Image as PILImage
-        import torch
-    except ImportError:
-        return "", False
-
-    try:
-        info("Initializing TrOCR (microsoft/trocr-base-printed)...")
-        info("First run downloads ~400MB model — cached after that")
-
-        processor = TrOCRProcessor.from_pretrained(
-            "microsoft/trocr-base-printed",
-            use_fast=True
-        )
-        model = VisionEncoderDecoderModel.from_pretrained(
-            "microsoft/trocr-base-printed"
-        )
-        device = "cuda" if __import__("torch").cuda.is_available() else "cpu"
-        model.to(device)
-        model.eval()
-        ok(f"TrOCR loaded on {device}")
-
-        # Convert input to PIL image
-        if isinstance(image_input, str):
-            pil_img = PILImage.open(image_input).convert("RGB")
-        else:
-            import numpy as np
-            if len(image_input.shape) == 2:
-                # Grayscale → RGB
-                pil_img = PILImage.fromarray(
-                    cv2.cvtColor(image_input, cv2.COLOR_GRAY2RGB)
-                )
-            else:
-                pil_img = PILImage.fromarray(
-                    cv2.cvtColor(image_input, cv2.COLOR_BGR2RGB)
-                )
-
-        h, w = pil_img.size[1], pil_img.size[0]
-
-        # ── Crop into horizontal bands and OCR each ────────
-        # Aadhaar card text is in rows — TrOCR reads one line at a time
-        # We use 8 equal horizontal slices to cover all text rows
-        num_bands = 8
-        band_h    = h // num_bands
-        all_lines = []
-
-        import torch
-        with torch.no_grad():
-            for i in range(num_bands):
-                y1 = i * band_h
-                y2 = min((i + 1) * band_h, h)
-                band = pil_img.crop((0, y1, w, y2))
-
-                # Skip nearly-white bands (no text)
-                import numpy as np
-                band_arr = np.array(band)
-                if np.mean(band_arr) > 245:
-                    continue
-
-                pixel_values = processor(
-                    images=band,
-                    return_tensors="pt"
-                ).pixel_values.to(device)
-
-                generated_ids = model.generate(pixel_values)
-                text = processor.batch_decode(
-                    generated_ids,
-                    skip_special_tokens=True
-                )[0].strip()
-
-                if text:
-                    all_lines.append(text)
-
-        combined = "\n".join(all_lines)
-        ok(f"TrOCR extracted {len(combined)} chars from {len(all_lines)} bands")
-        return combined, True
-
-    except Exception as e:
-        warn(f"TrOCR failed: {e}")
-        return "", False
-
-
 def step13_tesseract(binary, original_color, image_path=None):
     """
     Step 13 — Dual-Engine OCR: PaddleOCR (primary) + Tesseract (fallback)
@@ -337,9 +221,9 @@ def step13_tesseract(binary, original_color, image_path=None):
         warn("Triggering Engine 3: TrOCR (Transformer OCR) for blur recovery")
         print()
         trocr_input = image_path if image_path else original_color
-        trocr_text, trocr_available = run_trocr(trocr_input)
+        trocr_text, trocr_conf, trocr_available = run_trocr(trocr_input, confidence_threshold=0.5)
         if trocr_available and trocr_text.strip():
-            ok(f"TrOCR recovered {len(trocr_text)} additional chars")
+            ok(f"TrOCR recovered {len(trocr_text)} additional chars (conf={trocr_conf:.3f})")
             all_texts.append(trocr_text)
         elif trocr_available:
             warn("TrOCR also returned empty — image may be too degraded")
@@ -490,4 +374,3 @@ def run_trocr(image_input, confidence_threshold=0.5):
     except Exception as e:
         warn(f"TrOCR failed: {e}")
         return "", 0.0, False
-

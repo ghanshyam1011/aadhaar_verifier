@@ -8,7 +8,6 @@
 import os
 import sys
 
-from numpy import rint
 from codecarbon import EmissionsTracker
 
 from utils import section, ok, info, warn, err
@@ -147,8 +146,7 @@ def run_pipeline(front_path, back_path=None, selfie_path=None):
     tracker = EmissionsTracker()
     tracker.start()
 
-    DOC_TYPE = "aadhaar"
-
+    # ── Process FRONT side ───────────────────────────────────
     front_orig  = step1_load(front_path)
     front_res   = step2_resize(front_orig)
     front_sr    = step2b_super_resolution(front_res)
@@ -159,25 +157,56 @@ def run_pipeline(front_path, back_path=None, selfie_path=None):
     front_den   = step7_denoise(front_gray)
     front_enh   = step8_clahe(front_den)
     front_sh    = step9_adaptive_sharpen(front_enh)
-
     f_otsu, f_adap, f_blend = step10_binarize(front_sh)
     front_desk  = step11_deskew(f_blend)
     front_clean = step12_morph(front_desk)
 
     front_text, front_passes = step13_tesseract(front_clean, front_ori, front_path)
 
-    combined_text = front_text
+    combined_text  = front_text
     all_pass_texts = front_passes
+
+    # ── Process BACK side (if provided) ──────────────────────
+    if back_path:
+        back_orig  = step1_load(back_path)
+        back_res   = step2_resize(back_orig)
+        back_sr    = step2b_super_resolution(back_res)
+        back_ori   = step3_orient(back_sr)
+        back_nc    = step5_remove_color_noise(back_ori)
+        back_gray  = step6_grayscale(back_nc)
+        back_den   = step7_denoise(back_gray)
+        back_enh   = step8_clahe(back_den)
+        back_sh    = step9_adaptive_sharpen(back_enh)
+        b_otsu, b_adap, b_blend = step10_binarize(back_sh)
+        back_desk  = step11_deskew(b_blend)
+        back_clean = step12_morph(back_desk)
+        back_text, back_passes = step13_tesseract(back_clean, back_ori, back_path)
+        combined_text  += "\n" + back_text
+        all_pass_texts += back_passes
 
     fields = step14_extract(combined_text)
     fields = step14b_correct(fields, all_pass_texts)
+
+    # ── TrOCR pass ───────────────────────────────────────────
+    info("Running TrOCR for additional OCR diversity...")
+    trocr_text, trocr_conf, trocr_ok = run_trocr(front_path, confidence_threshold=0.5)
+    if trocr_ok and trocr_text.strip():
+        combined_text  += "\n" + trocr_text
+        all_pass_texts += [trocr_text]
+        ok(f"TrOCR added {len(trocr_text)} chars (conf={trocr_conf:.3f})")
+    elif not trocr_ok:
+        info("TrOCR not available — install: pip install transformers torch")
+
+    # ── LLM correction ───────────────────────────────────────
+    fields = step14c_llm_correct(fields, raw_ocr_text=combined_text)
 
     verification, all_valid = step15_verify(fields)
 
     face_result = step19_face_pipeline(front_orig, front_path,
                                        selfie_path=selfie_path)
 
-    qr_result = step18_qr_verify(front_path, fields)
+    qr_source = back_path if back_path else front_path
+    qr_result = step18_qr_verify(qr_source, fields)
 
     result = {
         "fields": fields,
@@ -187,13 +216,13 @@ def run_pipeline(front_path, back_path=None, selfie_path=None):
             "score": 80 if all_valid else 40,
             "color": "green" if all_valid else "yellow",
             "passed": [],
-            "issues": []
+            "issues": [s for s in qr_result.get("fraud_signals", [])]
         },
         "qr": qr_result,
         "face": face_result
     }
-    emissions = tracker.stop()
 
+    emissions = tracker.stop()
     print("\n🌱 Carbon Emission Report")
     print(f"Estimated CO₂ emissions: {emissions:.6f} kg")
 

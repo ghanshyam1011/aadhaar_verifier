@@ -1,64 +1,227 @@
 # qr_verification.py
 # Step 18: QR Code Extraction & Cross-Verification
-#   Helpers: _deblur_wiener(), _detect_qr_opencv(), _detect_qr_pyzbar(), _parse_aadhaar_qr()
-#   Comparators: _normalize_name_for_compare(), _names_match(),
-#                _dobs_match(), _aadhaar_nums_match()
-#   Main: step18_qr_verify()
+#
+# WHAT'S NEW — Secure QR V5 support:
+#   Real Aadhaar cards since ~2019 use "Secure QR" format.
+#   The QR contains a large decimal integer which, when decoded,
+#   is a gzip/zlib compressed pipe-delimited payload with ALL
+#   cardholder fields — no encryption, no UIDAI SDK needed.
+#
+#   Fields extracted from Secure QR V5:
+#     name, dob, gender, address (full structured), PIN,
+#     district, state, mobile_last4, reference_id
+#
+#   All fields are now cross-checked against OCR output.
+#
+# TRUST SCORE (updated):
+#   QR found           : +10 pts
+#   QR decoded         : +10 pts
+#   Name matches       : +20 pts
+#   DOB matches        : +20 pts
+#   Gender matches     : +10 pts
+#   PIN matches        : +10 pts
+#   District matches   : +10 pts
+#   State matches      : +10 pts
+#   Max possible       : 100 pts
+#
+#   Score >= 80 -> LIKELY GENUINE
+#   Score 50-79 -> REVIEW REQUIRED
+#   Score < 50  -> FRAUD SUSPECTED
+#
+# INSTALL:
+#   pip install pyzbar pillow opencv-python
+#   Ubuntu: sudo apt install libzbar0
 # ─────────────────────────────────────────────────────────────
-# Updated: Maximum QR detection — 30+ preprocessing variants
-#          including region crop, inversion, gamma, bilateral,
-#          rotation, and WeChatQRCode detector.
 
 import cv2
 import re
+import zlib
 import numpy as np
 
 from utils import section, ok, info, warn, err
 
-# ═════════════════════════════════════════════════════════════
-#  STEP 18 — QR Code Extraction & Cross-Verification
-#
-#  WHY THIS IS YOUR MOAT:
-#    Every genuine Aadhaar card has a QR code printed on it.
-#    The QR encodes the cardholder's data (name, DOB, gender,
-#    address) in a structured XML/string format, optionally
-#    signed by UIDAI. A tampered document (edited photo,
-#    photoshopped number, AI-generated fake) will either:
-#      (a) have no valid QR at all, or
-#      (b) have a QR whose contents don't match the printed text
-#
-#  TRUST SCORE FORMULA:
-#    ┌─────────────────────────────────────────────────────┐
-#    │  QR Found           : +20 pts                       │
-#    │  QR Decoded         : +10 pts                       │
-#    │  Aadhaar# matches   : +35 pts  (highest weight)     │
-#    │  Name matches       : +20 pts                       │
-#    │  DOB matches        : +10 pts                       │
-#    │  Gender matches     : +5  pts                       │
-#    │                     ─────                           │
-#    │  Max possible       : 100 pts                       │
-#    └─────────────────────────────────────────────────────┘
-#    Score ≥ 80 → LIKELY GENUINE
-#    Score 50–79 → REVIEW REQUIRED
-#    Score < 50 → FRAUD SUSPECTED
-#
-#  INSTALL (optional, improves QR detection on blurry images):
-#    pip install pyzbar pillow numpy
-#    Ubuntu: sudo apt install libzbar0
-# ═════════════════════════════════════════════════════════════
+
+# ─────────────────────────────────────────────────────────────
+#  SECURE QR DECODER  (the core new feature)
+# ─────────────────────────────────────────────────────────────
+
+def _decode_secure_qr(raw_bytes_or_str):
+    """
+    Decode UIDAI Secure QR (V2-V5) payload into a field dict.
+
+    HOW IT WORKS:
+      The QR stores a large decimal integer as an ASCII string.
+      Converting that integer to bytes gives a gzip/zlib-compressed
+      pipe-delimited (0xFF separator) record:
+
+        V5 | 2 | <ref_id> | <name> | <dob> | <gender> | (co) |
+        <district> | <landmark> | <building> | <locality> |
+        <pin> | <vtc> | <state> | <street> | <subdist> |
+        <dist2> | <mobile_masked> | (email_flag)
+
+      Fields are separated by 0xFF bytes.
+      No encryption — plain zlib compression only.
+
+    Args:
+        raw_bytes_or_str : bytes or str from pyzbar / OpenCV
+
+    Returns:
+        dict with all extracted fields, or {} on failure
+    """
+    if not raw_bytes_or_str:
+        return {}
+
+    # Get the digit string
+    if isinstance(raw_bytes_or_str, bytes):
+        try:
+            digit_str = raw_bytes_or_str.decode('ascii').strip()
+        except Exception:
+            return {}
+    else:
+        digit_str = str(raw_bytes_or_str).strip()
+
+    if not digit_str.isdigit():
+        return {}
+
+    info(f"  Secure QR detected: {len(digit_str)} digit integer")
+
+    # Convert big integer to bytes
+    try:
+        big_int = int(digit_str)
+        n_bytes = (big_int.bit_length() + 7) // 8
+        raw     = big_int.to_bytes(n_bytes, byteorder='big')
+    except Exception as e:
+        warn(f"  Secure QR int->bytes failed: {e}")
+        return {}
+
+    # Decompress — try all zlib modes and byte offsets
+    decompressed = None
+    for skip in range(0, min(15, len(raw))):
+        for wbits in [47, 15, -15]:
+            try:
+                dec = zlib.decompress(raw[skip:], wbits)
+                if len(dec) > 10:
+                    decompressed = dec
+                    info(f"  Decompressed at offset={skip} wbits={wbits}: {len(dec)} bytes")
+                    break
+            except Exception:
+                pass
+        if decompressed:
+            break
+
+    if not decompressed:
+        warn("  Secure QR decompression failed")
+        return {}
+
+    # Split on 0xFF byte delimiter
+    parts = decompressed.split(b'\xff')
+    fields_raw = []
+    for p in parts:
+        try:
+            fields_raw.append(p.decode('utf-8', errors='replace').strip())
+        except Exception:
+            fields_raw.append('')
+
+    info(f"  Parsed {len(fields_raw)} raw fields from Secure QR")
+    for i, f in enumerate(fields_raw[:20]):
+        if f and not any(ord(c) < 9 for c in f):
+            info(f"    [{i:02d}] {f[:80]}")
+
+    def _get(idx, default=''):
+        if idx < len(fields_raw):
+            v = fields_raw[idx].strip()
+            # Skip binary garbage
+            if any(ord(c) < 32 and c not in '\t\n\r' for c in v):
+                return default
+            return v
+        return default
+
+    # V5 field layout (0-indexed after 0xFF split):
+    #  0  version e.g. "V5"
+    #  1  format marker e.g. "2"
+    #  2  reference_id
+    #  3  name
+    #  4  dob  (DD-MM-YYYY)
+    #  5  gender (M/F/T)
+    #  6  care_of (C/O)
+    #  7  district
+    #  8  landmark
+    #  9  building / house name
+    #  10 locality / village
+    #  11 PIN code
+    #  12 vtc / sub-district
+    #  13 state
+    #  14 full street address
+    #  15 sub-district 2
+    #  16 district 2
+    #  17 mobile (masked e.g. XXXXXX4051)
+    #  18 (empty)
+    #  19 email flag (O=not registered, Y=registered)
+
+    version = _get(0)
+
+    # Normalise gender
+    g_raw   = _get(5).upper()
+    gender_map = {
+        'M': 'Male', 'MALE': 'Male',
+        'F': 'Female', 'FEMALE': 'Female',
+        'T': 'Transgender', 'TRANSGENDER': 'Transgender',
+    }
+    gender = gender_map.get(g_raw, g_raw.capitalize() if g_raw else '')
+
+    # Normalise DOB: QR uses DD-MM-YYYY -> DD/MM/YYYY
+    dob_raw = _get(4)
+    dob     = re.sub(r'[-.]', '/', dob_raw) if dob_raw else ''
+
+    # Mobile last 4
+    mobile_raw   = _get(17)
+    mobile_last4 = ''
+    if mobile_raw:
+        digits = re.sub(r'\D', '', mobile_raw)
+        mobile_last4 = digits[-4:] if len(digits) >= 4 else digits
+
+    email_flag       = _get(19)
+    email_registered = (email_flag.upper() == 'Y')
+
+    result = {
+        'qr_version':       version,
+        'reference_id':     _get(2),
+        'name':             _get(3).upper(),
+        'dob':              dob,
+        'gender':           gender,
+        'care_of':          _get(6),
+        'district':         _get(7),
+        'landmark':         _get(8),
+        'building':         _get(9),
+        'locality':         _get(10),
+        'pin':              _get(11),
+        'vtc':              _get(12),
+        'state':            _get(13),
+        'street':           _get(14),
+        'subdistrict':      _get(15),
+        'district2':        _get(16),
+        'mobile_masked':    mobile_raw,
+        'mobile_last4':     mobile_last4,
+        'email_registered': email_registered,
+        # Aadhaar number intentionally absent from Secure QR (UIDAI privacy)
+        'aadhaar_number':   None,
+        'aadhaar_last4':    None,
+    }
+
+    ok(f"  Secure QR decoded: name='{result['name']}' dob='{result['dob']}' "
+       f"gender='{result['gender']}' pin='{result['pin']}'")
+
+    return result
 
 
 # ─────────────────────────────────────────────────────────────
-#  BLUR / EXPOSURE PREPROCESSING HELPERS
+#  PREPROCESSING HELPERS
 # ─────────────────────────────────────────────────────────────
 
 def _deblur_wiener(gray, kernel_size=5, noise_power=0.01):
-    """
-    Frequency-domain Wiener filter to reverse Gaussian / camera blur.
-    """
     try:
-        kernel = np.ones((kernel_size, kernel_size), dtype=np.float32)
-        kernel /= kernel.sum()
+        kernel   = np.ones((kernel_size, kernel_size), dtype=np.float32)
+        kernel  /= kernel.sum()
         img_f    = np.fft.fft2(gray.astype(np.float32) / 255.0)
         ker_f    = np.fft.fft2(kernel, s=gray.shape)
         ker_conj = np.conj(ker_f)
@@ -70,27 +233,14 @@ def _deblur_wiener(gray, kernel_size=5, noise_power=0.01):
 
 
 def _unsharp_mask(gray, sigma=3, strength=1.8):
-    """Unsharp masking to enhance edges."""
     blurred   = cv2.GaussianBlur(gray, (0, 0), sigma)
     sharpened = cv2.addWeighted(gray, strength, blurred, -(strength - 1), 0)
     return np.clip(sharpened, 0, 255).astype(np.uint8)
 
 
 def _gamma_correct(gray, gamma):
-    """
-    Gamma correction — brightens dark images (gamma < 1)
-    or darkens overexposed images (gamma > 1).
-
-    Formula: output = (input / 255) ^ (1/gamma) * 255
-
-    Why this helps QR detection:
-      A dark scan makes QR finder patterns blend into background.
-      Gamma < 1 brightens shadows, revealing the white cells.
-      Gamma > 1 darkens a washed-out (overexposed) image,
-      increasing contrast between black/white QR modules.
-    """
     inv_gamma = 1.0 / gamma
-    table     = np.array([
+    table = np.array([
         ((i / 255.0) ** inv_gamma) * 255
         for i in range(256)
     ], dtype=np.uint8)
@@ -98,247 +248,187 @@ def _gamma_correct(gray, gamma):
 
 
 def _bilateral_denoise(gray):
-    """
-    Bilateral filter — removes noise while PRESERVING hard edges.
-
-    Unlike Gaussian blur (which blurs everything), bilateral filter
-    only averages pixels that are both spatially close AND similar
-    in intensity. This keeps QR finder-pattern edges sharp while
-    smoothing out JPEG compression artifacts and paper texture.
-
-    Why this helps QR detection:
-      JPEG compression creates 8×8 block artifacts that confuse
-      QR decoders into seeing false patterns. Bilateral removes
-      these without blurring the actual QR module boundaries.
-    """
     return cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75)
 
 
+# ─────────────────────────────────────────────────────────────
+#  QR REGION CROPS
+# ─────────────────────────────────────────────────────────────
+
 def _crop_qr_region(img_bgr):
-    """
-    Crop the region most likely to contain the Aadhaar QR code.
-
-    Aadhaar card layout (back side):
-      - The large QR code is always in the BOTTOM-RIGHT quadrant
-      - Roughly: right 45% of width, bottom 55% of height
-      - There's also a smaller QR on the front side (bottom-right)
-
-    Why crop helps:
-      The full card image has address text, logos, barcodes, and
-      the UIDAI hologram — all of which add noise for the QR
-      detector. Cropping to just the QR region dramatically
-      reduces false positives and speeds up detection.
-
-    Returns:
-      List of (label, cropped_bgr) tuples to try.
-    """
     h, w = img_bgr.shape[:2]
-    crops = []
-
-    # Back side — large QR: bottom-right
-    crops.append(("qr_region_br",
-                  img_bgr[int(h*0.45):h, int(w*0.55):w]))
-
-    # Back side — slightly wider crop (in case card is slightly rotated)
-    crops.append(("qr_region_br_wide",
-                  img_bgr[int(h*0.35):h, int(w*0.45):w]))
-
-    # Front side — small QR: bottom-right corner
-    crops.append(("qr_region_front_br",
-                  img_bgr[int(h*0.65):h, int(w*0.65):w]))
-
-    # Full right half (covers both orientations)
-    crops.append(("right_half",
-                  img_bgr[:, int(w*0.5):w]))
-
-    # Full bottom half
-    crops.append(("bottom_half",
-                  img_bgr[int(h*0.5):h, :]))
-
-    # Filter out empty crops
+    crops = [
+        ("qr_region_br",       img_bgr[int(h*0.45):h,  int(w*0.55):w]),
+        ("qr_region_br_wide",  img_bgr[int(h*0.35):h,  int(w*0.45):w]),
+        ("qr_region_front_br", img_bgr[int(h*0.65):h,  int(w*0.65):w]),
+        ("right_half",         img_bgr[:,               int(w*0.5):w]),
+        ("bottom_half",        img_bgr[int(h*0.5):h,   :]),
+        ("full",               img_bgr),
+    ]
     return [(lbl, c) for lbl, c in crops
-            if c is not None and c.size > 0 and c.shape[0] > 20 and c.shape[1] > 20]
+            if c is not None and c.size > 0
+            and c.shape[0] > 20 and c.shape[1] > 20]
 
+
+# ─────────────────────────────────────────────────────────────
+#  PREPROCESSING VARIANTS
+#  Upscale tiers come FIRST because Secure QR is very dense
+#  and needs at least 2x resolution to decode reliably.
+# ─────────────────────────────────────────────────────────────
 
 def _build_preprocessing_variants(img_bgr):
-    """
-    Generate ALL preprocessing variants to try.
-    Ordered from cheapest/most-likely to most expensive/last-resort.
-
-    Each variant is (label, bgr_image).
-    The caller tries each in order and stops at the first QR decode.
-
-    TOTAL VARIANTS: ~50 across all combinations.
-    """
-    gray     = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    gray   = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    h, w   = img_bgr.shape[:2]
+    clahe  = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    clahe2 = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(4, 4))
     variants = []
 
-    # ── Tier 1: Direct (fast) ────────────────────────────────
-    variants.append(("raw",         img_bgr))
-    variants.append(("raw_gray",    cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)))
+    # Tier 0: Upscaled — most important for Secure QR
+    for scale in [2, 3, 4]:
+        up      = cv2.resize(img_bgr, (w * scale, h * scale),
+                             interpolation=cv2.INTER_CUBIC)
+        up_gray = cv2.cvtColor(up, cv2.COLOR_BGR2GRAY)
 
-    # ── Tier 2: Inversion ────────────────────────────────────
-    # Some Aadhaar printouts have white QR on dark background,
-    # or a scan inverts the image. Always try inverted.
+        _, up_otsu = cv2.threshold(up_gray, 0, 255,
+                                   cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        variants.append((f"up{scale}x_otsu",
+                         cv2.cvtColor(up_otsu, cv2.COLOR_GRAY2BGR)))
+
+        up_usm = _unsharp_mask(up_gray, sigma=2, strength=1.5)
+        _, up_usm_otsu = cv2.threshold(up_usm, 0, 255,
+                                       cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        variants.append((f"up{scale}x_usm_otsu",
+                         cv2.cvtColor(up_usm_otsu, cv2.COLOR_GRAY2BGR)))
+
+        up_cl = clahe.apply(up_gray)
+        variants.append((f"up{scale}x_clahe",
+                         cv2.cvtColor(up_cl, cv2.COLOR_GRAY2BGR)))
+
+        up_adap = cv2.adaptiveThreshold(
+            up_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, 11, 2)
+        variants.append((f"up{scale}x_adaptive",
+                         cv2.cvtColor(up_adap, cv2.COLOR_GRAY2BGR)))
+
+        for crop_label, crop_img in _crop_qr_region(up):
+            cg = cv2.cvtColor(crop_img, cv2.COLOR_BGR2GRAY)
+            _, co = cv2.threshold(cg, 0, 255,
+                                  cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            variants.append((f"up{scale}x_{crop_label}_otsu",
+                             cv2.cvtColor(co, cv2.COLOR_GRAY2BGR)))
+
+    # Tier 1: Raw
+    variants.append(("raw",      img_bgr))
+    variants.append(("raw_gray", cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)))
+
+    # Tier 2: Inversion
     inv_gray = cv2.bitwise_not(gray)
-    variants.append(("inverted",    cv2.cvtColor(inv_gray, cv2.COLOR_GRAY2BGR)))
+    variants.append(("inverted", cv2.cvtColor(inv_gray, cv2.COLOR_GRAY2BGR)))
 
-    # ── Tier 3: Gamma correction ─────────────────────────────
-    # Dark scan: gamma=0.4 brightens; overexposed: gamma=2.0 darkens
+    # Tier 3: Gamma
     for gamma in [0.4, 0.6, 1.5, 2.0]:
         g = _gamma_correct(gray, gamma)
         variants.append((f"gamma_{gamma}",
                          cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)))
 
-    # ── Tier 4: CLAHE ────────────────────────────────────────
-    clahe   = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    cl_gray = clahe.apply(gray)
-    variants.append(("clahe",       cv2.cvtColor(cl_gray, cv2.COLOR_GRAY2BGR)))
-
-    # Tighter CLAHE (8px tiles — better for small QR modules)
-    clahe2   = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(4, 4))
+    # Tier 4: CLAHE
+    cl_gray  = clahe.apply(gray)
     cl2_gray = clahe2.apply(gray)
+    variants.append(("clahe",       cv2.cvtColor(cl_gray,  cv2.COLOR_GRAY2BGR)))
     variants.append(("clahe_tight", cv2.cvtColor(cl2_gray, cv2.COLOR_GRAY2BGR)))
 
-    # ── Tier 5: Bilateral denoise ────────────────────────────
+    # Tier 5: Bilateral
     bil_gray = _bilateral_denoise(gray)
-    variants.append(("bilateral",   cv2.cvtColor(bil_gray, cv2.COLOR_GRAY2BGR)))
-
-    # Bilateral then CLAHE — JPEG artifact removal then contrast
     bil_cl   = clahe.apply(bil_gray)
+    variants.append(("bilateral",
+                     cv2.cvtColor(bil_gray, cv2.COLOR_GRAY2BGR)))
     variants.append(("bilateral+clahe",
-                     cv2.cvtColor(bil_cl, cv2.COLOR_GRAY2BGR)))
+                     cv2.cvtColor(bil_cl,   cv2.COLOR_GRAY2BGR)))
 
-    # ── Tier 6: Unsharp mask ─────────────────────────────────
-    usm_gray = _unsharp_mask(gray, sigma=3, strength=1.8)
-    variants.append(("unsharp_mask",
-                     cv2.cvtColor(usm_gray, cv2.COLOR_GRAY2BGR)))
-
-    # Stronger sharpening for very blurry images
+    # Tier 6: Unsharp mask
+    usm_gray   = _unsharp_mask(gray, sigma=3, strength=1.8)
     usm_strong = _unsharp_mask(gray, sigma=5, strength=2.5)
+    cl_usm     = _unsharp_mask(cl_gray, sigma=3, strength=1.8)
+    variants.append(("unsharp_mask",
+                     cv2.cvtColor(usm_gray,   cv2.COLOR_GRAY2BGR)))
     variants.append(("unsharp_strong",
                      cv2.cvtColor(usm_strong, cv2.COLOR_GRAY2BGR)))
+    variants.append(("clahe+usm",
+                     cv2.cvtColor(cl_usm,     cv2.COLOR_GRAY2BGR)))
 
-    # CLAHE + unsharp mask
-    cl_usm   = _unsharp_mask(cl_gray, sigma=3, strength=1.8)
-    variants.append(("clahe+usm",   cv2.cvtColor(cl_usm, cv2.COLOR_GRAY2BGR)))
-
-    # ── Tier 7: Wiener deconvolution ─────────────────────────
+    # Tier 7: Wiener
     wiener_gray   = _deblur_wiener(gray, kernel_size=5, noise_power=0.01)
     wiener_strong = _deblur_wiener(gray, kernel_size=9, noise_power=0.005)
-    variants.append(("wiener",        cv2.cvtColor(wiener_gray,   cv2.COLOR_GRAY2BGR)))
-    variants.append(("wiener_strong", cv2.cvtColor(wiener_strong, cv2.COLOR_GRAY2BGR)))
+    variants.append(("wiener",
+                     cv2.cvtColor(wiener_gray,   cv2.COLOR_GRAY2BGR)))
+    variants.append(("wiener_strong",
+                     cv2.cvtColor(wiener_strong, cv2.COLOR_GRAY2BGR)))
 
-    # ── Tier 8: Binarization ─────────────────────────────────
+    # Tier 8: Binarization
     _, otsu = cv2.threshold(gray, 0, 255,
                             cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    variants.append(("otsu",         cv2.cvtColor(otsu, cv2.COLOR_GRAY2BGR)))
-    variants.append(("otsu_inv",     cv2.cvtColor(cv2.bitwise_not(otsu),
-                                                   cv2.COLOR_GRAY2BGR)))
-
-    # Adaptive threshold — handles uneven illumination
-    adapt = cv2.adaptiveThreshold(
+    adapt    = cv2.adaptiveThreshold(
         gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY, 11, 2)
-    variants.append(("adaptive_thresh",
-                     cv2.cvtColor(adapt, cv2.COLOR_GRAY2BGR)))
-
-    # Adaptive on CLAHE image
     adapt_cl = cv2.adaptiveThreshold(
         cl_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY, 11, 2)
-    variants.append(("clahe+adaptive",
-                     cv2.cvtColor(adapt_cl, cv2.COLOR_GRAY2BGR)))
-
-    # Adaptive on bilateral-denoised image
     adapt_bil = cv2.adaptiveThreshold(
         bil_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY, 11, 2)
+    variants.append(("otsu",
+                     cv2.cvtColor(otsu,      cv2.COLOR_GRAY2BGR)))
+    variants.append(("otsu_inv",
+                     cv2.cvtColor(cv2.bitwise_not(otsu), cv2.COLOR_GRAY2BGR)))
+    variants.append(("adaptive",
+                     cv2.cvtColor(adapt,     cv2.COLOR_GRAY2BGR)))
+    variants.append(("clahe+adaptive",
+                     cv2.cvtColor(adapt_cl,  cv2.COLOR_GRAY2BGR)))
     variants.append(("bilateral+adaptive",
                      cv2.cvtColor(adapt_bil, cv2.COLOR_GRAY2BGR)))
 
-    # ── Tier 9: Morphological cleanup ────────────────────────
+    # Tier 9: Morphological
     k3 = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     k2 = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-    morph_open  = cv2.morphologyEx(otsu, cv2.MORPH_OPEN,  k3)
-    morph_close = cv2.morphologyEx(otsu, cv2.MORPH_CLOSE, k2)
     variants.append(("morph_open",
-                     cv2.cvtColor(morph_open,  cv2.COLOR_GRAY2BGR)))
+                     cv2.cvtColor(
+                         cv2.morphologyEx(otsu, cv2.MORPH_OPEN,  k3),
+                         cv2.COLOR_GRAY2BGR)))
     variants.append(("morph_close",
-                     cv2.cvtColor(morph_close, cv2.COLOR_GRAY2BGR)))
+                     cv2.cvtColor(
+                         cv2.morphologyEx(otsu, cv2.MORPH_CLOSE, k2),
+                         cv2.COLOR_GRAY2BGR)))
 
-    # ── Tier 10: QR region crops + preprocessing ─────────────
-    # Try every crop region with the top preprocessing variants
+    # Tier 10: QR region crops on original
     for crop_label, crop_img in _crop_qr_region(img_bgr):
         if crop_img.size == 0:
             continue
-        crop_gray = cv2.cvtColor(crop_img, cv2.COLOR_BGR2GRAY)
-
+        cg = cv2.cvtColor(crop_img, cv2.COLOR_BGR2GRAY)
         variants.append((f"{crop_label}_raw",  crop_img))
         variants.append((f"{crop_label}_inv",
-                         cv2.cvtColor(cv2.bitwise_not(crop_gray),
+                         cv2.cvtColor(cv2.bitwise_not(cg),
                                       cv2.COLOR_GRAY2BGR)))
-
-        _, c_otsu = cv2.threshold(crop_gray, 0, 255,
-                                  cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        _, co = cv2.threshold(cg, 0, 255,
+                              cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         variants.append((f"{crop_label}_otsu",
-                         cv2.cvtColor(c_otsu, cv2.COLOR_GRAY2BGR)))
-
-        c_cl = clahe.apply(crop_gray)
+                         cv2.cvtColor(co, cv2.COLOR_GRAY2BGR)))
+        cc = clahe.apply(cg)
         variants.append((f"{crop_label}_clahe",
-                         cv2.cvtColor(c_cl, cv2.COLOR_GRAY2BGR)))
+                         cv2.cvtColor(cc, cv2.COLOR_GRAY2BGR)))
 
-        c_usm = _unsharp_mask(crop_gray, sigma=3, strength=1.8)
-        variants.append((f"{crop_label}_usm",
-                         cv2.cvtColor(c_usm, cv2.COLOR_GRAY2BGR)))
-
-    # ── Tier 11: Rotation variants ───────────────────────────
-    # If the card was photographed sideways or upside-down,
-    # the QR decoder will fail even on a clear image.
-    for angle, label in [(90,  "rot90"),
-                         (180, "rot180"),
-                         (270, "rot270")]:
-        rotated = cv2.rotate(img_bgr, {
-            90:  cv2.ROTATE_90_CLOCKWISE,
-            180: cv2.ROTATE_180,
-            270: cv2.ROTATE_90_COUNTERCLOCKWISE
-        }[angle])
-        variants.append((label, rotated))
-
-        # Also try Otsu on each rotation
-        rot_gray  = cv2.cvtColor(rotated, cv2.COLOR_BGR2GRAY)
+    # Tier 11: Rotation
+    for angle, label, rot_code in [
+        (90,  "rot90",  cv2.ROTATE_90_CLOCKWISE),
+        (180, "rot180", cv2.ROTATE_180),
+        (270, "rot270", cv2.ROTATE_90_COUNTERCLOCKWISE),
+    ]:
+        rotated  = cv2.rotate(img_bgr, rot_code)
+        rot_gray = cv2.cvtColor(rotated, cv2.COLOR_BGR2GRAY)
         _, rot_otsu = cv2.threshold(rot_gray, 0, 255,
                                     cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        variants.append((label, rotated))
         variants.append((f"{label}_otsu",
                          cv2.cvtColor(rot_otsu, cv2.COLOR_GRAY2BGR)))
-
-    # ── Tier 12: Scale cascade ───────────────────────────────
-    # Most effective on low-resolution images (< 400 px QR region).
-    # Upscaling gives the QR decoder more pixels to work with.
-    h, w = img_bgr.shape[:2]
-    for scale in [1.5, 2.0, 3.0]:
-        up      = cv2.resize(img_bgr,
-                             (int(w * scale), int(h * scale)),
-                             interpolation=cv2.INTER_CUBIC)
-        up_gray = cv2.cvtColor(up, cv2.COLOR_BGR2GRAY)
-        up_usm  = _unsharp_mask(up_gray, sigma=3, strength=1.8)
-        variants.append((f"upscale_{scale}x+usm",
-                         cv2.cvtColor(up_usm, cv2.COLOR_GRAY2BGR)))
-
-        _, up_otsu = cv2.threshold(up_usm, 0, 255,
-                                   cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        variants.append((f"upscale_{scale}x+otsu",
-                         cv2.cvtColor(up_otsu, cv2.COLOR_GRAY2BGR)))
-
-        # Also try crops on the upscaled image
-        for crop_label, crop_img in _crop_qr_region(up):
-            if crop_img.size == 0:
-                continue
-            crop_gray = cv2.cvtColor(crop_img, cv2.COLOR_BGR2GRAY)
-            _, c_otsu = cv2.threshold(crop_gray, 0, 255,
-                                      cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            variants.append((f"upscale_{scale}x+{crop_label}_otsu",
-                             cv2.cvtColor(c_otsu, cv2.COLOR_GRAY2BGR)))
 
     return variants
 
@@ -348,16 +438,6 @@ def _build_preprocessing_variants(img_bgr):
 # ─────────────────────────────────────────────────────────────
 
 def _try_wechat_qr(img_bgr):
-    """
-    Try WeChatQRCode detector from opencv-contrib-python.
-    FAR more robust than the built-in QRCodeDetector —
-    uses a deep learning model trained on real-world QR codes.
-
-    Install: pip install opencv-contrib-python
-    (replaces opencv-python — uninstall it first)
-
-    Returns (text, bbox) or (None, None).
-    """
     try:
         detector = cv2.wechat_qrcode_WeChatQRCode()
         texts, points = detector.detectAndDecode(img_bgr)
@@ -369,60 +449,37 @@ def _try_wechat_qr(img_bgr):
 
 
 def _detect_qr_opencv(img_bgr):
-    """
-    Attempt QR detection using OpenCV's built-in QRCodeDetector,
-    trying every preprocessing variant in order.
-    Also attempts WeChatQRCode if opencv-contrib is installed.
-
-    Returns (raw_str, bbox, variant_label) or (None, None, None).
-    """
-    # Try WeChatQRCode first on raw image — if available it's the best
     text, bbox = _try_wechat_qr(img_bgr)
     if text:
         return text, bbox, "WeChatQRCode_raw"
-
     detector = cv2.QRCodeDetector()
-
     for label, variant_img in _build_preprocessing_variants(img_bgr):
-        # Try WeChatQRCode on each variant too
         text, bbox = _try_wechat_qr(variant_img)
         if text:
             return text, bbox, f"WeChatQRCode_{label}"
-
-        # Built-in OpenCV detector
         try:
             data, bbox, _ = detector.detectAndDecode(variant_img)
             if data and bbox is not None:
                 return data, bbox, label
         except Exception:
             pass
-
     return None, None, None
 
 
 def _detect_qr_pyzbar(img_bgr):
-    """
-    Attempt QR detection using pyzbar, trying every preprocessing variant.
-    Requires: pip install pyzbar   +   sudo apt install libzbar0
-
-    Returns list of (raw_data_str, polygon, variant_label) or empty list.
-    """
     try:
         from pyzbar import pyzbar
         from PIL import Image as PILImage
-
         for label, variant_img in _build_preprocessing_variants(img_bgr):
             pil_img = PILImage.fromarray(
-                cv2.cvtColor(variant_img, cv2.COLOR_BGR2RGB)
-            )
+                cv2.cvtColor(variant_img, cv2.COLOR_BGR2RGB))
             decoded = pyzbar.decode(pil_img)
             results = [
-                (obj.data.decode('utf-8', errors='replace'), obj.polygon, label)
+                (obj.data, obj.polygon, label)
                 for obj in decoded if obj.type == 'QRCODE'
             ]
             if results:
                 return results
-
         return []
     except ImportError:
         return []
@@ -431,174 +488,147 @@ def _detect_qr_pyzbar(img_bgr):
 
 
 # ─────────────────────────────────────────────────────────────
-#  QR PAYLOAD PARSER
+#  LEGACY QR PARSER  (XML / pipe-text / JSON — older cards)
 # ─────────────────────────────────────────────────────────────
 
-def _parse_aadhaar_qr(raw_data):
-    """
-    Parse the raw QR payload into a structured dict.
-
-    Aadhaar QR formats seen in the wild:
-      Format A — XML (older cards):
-        <PrintLetterBarcodeData uid="XXXX XXXX XXXX"
-          name="FULL NAME" dob="DD/MM/YYYY" gender="M/F/T" ... />
-
-      Format B — Pipe-delimited string (newer secure QR):
-        <version>|<uid_last4>|<name>|<dob>|<gender>|<co>|<house>|
-        <street>|<lm>|<loc>|<vtc>|<subdist>|<dist>|<state>|<pc>|
-        <mobile_last4>
-
-      Format C — JSON (rare, some states):
-        {"name": "...", "dob": "...", ...}
-
-    Returns dict with keys: name, dob, gender, aadhaar_last4,
-    aadhaar_number (if found), address_parts, mobile_last4
-    """
+def _parse_legacy_qr(raw_data):
     if not raw_data:
         return {}
-
+    raw = (raw_data.decode('utf-8', errors='replace')
+           if isinstance(raw_data, bytes) else str(raw_data)).strip()
     parsed = {}
-    raw    = raw_data.strip()
 
-    # ── Format A: XML ────────────────────────────────────────
+    # Format A: XML
     if raw.startswith('<') or 'PrintLetterBarcodeData' in raw:
         try:
             import xml.etree.ElementTree as ET
             root = ET.fromstring(raw)
             attr = root.attrib
-
             uid = attr.get('uid', attr.get('Uid', ''))
             if uid:
                 parsed['aadhaar_number'] = uid.replace('-', ' ')
                 digits = re.sub(r'\D', '', uid)
-                if len(digits) >= 4:
-                    parsed['aadhaar_last4'] = digits[-4:]
-
+                parsed['aadhaar_last4'] = digits[-4:] if len(digits) >= 4 else ''
             name = attr.get('name', attr.get('Name', ''))
             if name:
                 parsed['name'] = name.strip().upper()
-
-            dob = attr.get('dob', attr.get('Dob', attr.get('DOB', '')))
+            dob = attr.get('dob', attr.get('DOB', ''))
             if dob:
-                parsed['dob'] = dob.strip()
-
-            gender_raw = attr.get('gender', attr.get('Gender', ''))
-            if gender_raw:
-                g = gender_raw.strip().upper()
-                parsed['gender'] = (
-                    'Male'        if g in ('M', 'MALE')        else
-                    'Female'      if g in ('F', 'FEMALE')      else
-                    'Transgender' if g in ('T', 'TRANSGENDER') else g
-                )
-
-            addr_parts = []
-            for key in ('co', 'house', 'street', 'lm', 'loc', 'vtc',
-                        'subdist', 'dist', 'state', 'pc'):
-                v = attr.get(key, attr.get(key.capitalize(), ''))
-                if v and v.strip():
-                    addr_parts.append(v.strip())
-            if addr_parts:
-                parsed['address_parts'] = addr_parts
-
-            mobile = attr.get('mobile', attr.get('Mobile', ''))
-            if mobile and len(re.sub(r'\D', '', mobile)) >= 4:
-                parsed['mobile_last4'] = re.sub(r'\D', '', mobile)[-4:]
-
+                parsed['dob'] = re.sub(r'[-.]', '/', dob.strip())
+            g = attr.get('gender', attr.get('Gender', '')).upper()
+            parsed['gender'] = ('Male'        if g in ('M', 'MALE')        else
+                                'Female'      if g in ('F', 'FEMALE')      else
+                                'Transgender' if g in ('T', 'TRANSGENDER') else g)
+            parsed['district'] = attr.get('dist', '')
+            parsed['state']    = attr.get('state', '')
+            parsed['pin']      = attr.get('pc', '')
+            parsed['locality'] = attr.get('vtc', attr.get('loc', ''))
+            parsed['landmark'] = attr.get('lm', '')
+            parsed['building'] = attr.get('house', '')
+            parsed['street']   = attr.get('street', '')
+            parsed['care_of']  = attr.get('co', '')
+            mobile = attr.get('mobile', '')
+            if mobile:
+                digits = re.sub(r'\D', '', mobile)
+                parsed['mobile_last4'] = digits[-4:] if len(digits) >= 4 else ''
         except Exception as e:
-            warn(f"    QR XML parse error: {e}")
+            warn(f"  Legacy XML parse error: {e}")
 
-    # ── Format B: Pipe-delimited ─────────────────────────────
+    # Format B: Pipe plain text
     elif '|' in raw and not raw.startswith('{'):
         parts = raw.split('|')
         if len(parts) >= 5:
             try:
-                last4_or_uid = parts[1].strip()
-                if re.match(r'^\d{4,12}$', last4_or_uid):
-                    parsed['aadhaar_last4'] = last4_or_uid[-4:]
-
+                last4 = parts[1].strip()
+                if re.match(r'^\d{4,12}$', last4):
+                    parsed['aadhaar_last4'] = last4[-4:]
                 name = parts[2].strip()
                 if name and re.match(r'^[A-Za-z\s.\-]+$', name):
                     parsed['name'] = name.upper()
-
                 dob = parts[3].strip()
                 if re.match(r'\d{1,2}[/\-]\d{1,2}[/\-]\d{4}', dob):
-                    parsed['dob'] = dob
-
-                gender_raw = parts[4].strip().upper()
-                parsed['gender'] = (
-                    'Male'        if gender_raw in ('M', 'MALE', '1')        else
-                    'Female'      if gender_raw in ('F', 'FEMALE', '2')      else
-                    'Transgender' if gender_raw in ('T', 'TRANSGENDER', '3') else None
-                )
-
-                addr_parts = [p.strip() for p in parts[5:] if p.strip()]
-                if addr_parts:
-                    parsed['address_parts'] = addr_parts
-
-                if addr_parts:
-                    last_part = addr_parts[-1]
-                    if re.match(r'^\d{4}$', last_part):
-                        parsed['mobile_last4']  = last_part
-                        parsed['address_parts'] = addr_parts[:-1]
-
+                    parsed['dob'] = re.sub(r'[-.]', '/', dob)
+                g = parts[4].strip().upper()
+                parsed['gender'] = ('Male'        if g in ('M','MALE','1')        else
+                                    'Female'      if g in ('F','FEMALE','2')      else
+                                    'Transgender' if g in ('T','TRANSGENDER','3') else None)
+                addr = [p.strip() for p in parts[5:] if p.strip()]
+                parsed['pin']   = next((p for p in addr if re.match(r'^\d{6}$', p)), '')
+                parsed['state'] = addr[-2] if len(addr) >= 2 else ''
             except Exception as e:
-                warn(f"    QR pipe-delimited parse error: {e}")
+                warn(f"  Legacy pipe parse error: {e}")
 
-    # ── Format C: JSON ───────────────────────────────────────
+    # Format C: JSON
     elif raw.startswith('{'):
         try:
             import json
             data = json.loads(raw)
-
             name = data.get('name', data.get('Name', ''))
             if name:
                 parsed['name'] = str(name).strip().upper()
-
-            dob = data.get('dob', data.get('DOB', data.get('dateOfBirth', '')))
+            dob = data.get('dob', data.get('DOB', ''))
             if dob:
-                parsed['dob'] = str(dob).strip()
-
-            gender_raw = data.get('gender', data.get('Gender', ''))
-            if gender_raw:
-                g = str(gender_raw).strip().upper()
-                parsed['gender'] = (
-                    'Male'        if g in ('M', 'MALE')        else
-                    'Female'      if g in ('F', 'FEMALE')      else
-                    'Transgender' if g in ('T', 'TRANSGENDER') else g
-                )
-
-            uid = data.get('uid', data.get('UID', data.get('aadhaarNumber', '')))
+                parsed['dob'] = re.sub(r'[-.]', '/', str(dob).strip())
+            g = data.get('gender', data.get('Gender', '')).upper()
+            parsed['gender'] = ('Male' if g in ('M','MALE') else
+                                'Female' if g in ('F','FEMALE') else g)
+            uid = data.get('uid', data.get('UID', ''))
             if uid:
                 parsed['aadhaar_number'] = str(uid).replace('-', ' ')
                 digits = re.sub(r'\D', '', str(uid))
-                if len(digits) >= 4:
-                    parsed['aadhaar_last4'] = digits[-4:]
-
+                parsed['aadhaar_last4'] = digits[-4:] if len(digits) >= 4 else ''
+            parsed['pin']   = str(data.get('pc', data.get('pin', '')))
+            parsed['state'] = str(data.get('state', data.get('State', '')))
         except Exception as e:
-            warn(f"    QR JSON parse error: {e}")
+            warn(f"  Legacy JSON parse error: {e}")
 
-    # ── Fallback: regex mining ───────────────────────────────
+    # Fallback: regex mining
     if not parsed:
         m = re.search(r'\b([2-9]\d{3}[\s\-]?\d{4}[\s\-]?\d{4})\b', raw)
         if m:
             parsed['aadhaar_number'] = m.group(1).replace('-', ' ')
-
         m = re.search(r'\b([A-Z]{2,}\s[A-Z]{2,}(?:\s[A-Z]{2,})?)\b', raw)
         if m:
             parsed['name'] = m.group(1)
-
         m = re.search(r'\b(\d{2}[/\-]\d{2}[/\-]\d{4})\b', raw)
         if m:
-            parsed['dob'] = m.group(1)
+            parsed['dob'] = re.sub(r'[-.]', '/', m.group(1))
 
     return parsed
+
+
+# ─────────────────────────────────────────────────────────────
+#  UNIFIED QR PARSER
+# ─────────────────────────────────────────────────────────────
+
+def _parse_aadhaar_qr(raw_data):
+    """
+    Try Secure QR decode first (numeric digit string >= 100 digits).
+    Fall back to legacy XML/pipe/JSON parser for older cards.
+    """
+    if not raw_data:
+        return {}
+
+    digit_str = (raw_data.decode('ascii', errors='ignore')
+                 if isinstance(raw_data, bytes) else str(raw_data)).strip()
+
+    if digit_str.isdigit() and len(digit_str) >= 100:
+        result = _decode_secure_qr(raw_data)
+        if result:
+            result['_format'] = 'secure_qr'
+            return result
+
+    result = _parse_legacy_qr(raw_data)
+    if result:
+        result['_format'] = 'legacy'
+    return result
 
 
 # ─────────────────────────────────────────────────────────────
 #  FIELD COMPARATORS
 # ─────────────────────────────────────────────────────────────
 
-def _normalize_name_for_compare(name):
+def _normalize_name(name):
     if not name:
         return ''
     n = re.sub(r"[^A-Za-z\s]", "", name.upper())
@@ -606,26 +636,21 @@ def _normalize_name_for_compare(name):
 
 
 def _names_match(ocr_name, qr_name, threshold=0.75):
-    a = _normalize_name_for_compare(ocr_name)
-    b = _normalize_name_for_compare(qr_name)
-
+    a = _normalize_name(ocr_name)
+    b = _normalize_name(qr_name)
     if not a or not b:
         return False, 0.0, "one side empty"
     if a == b:
         return True, 1.0, "exact match"
-
     def bigrams(s):
         s = s.replace(' ', '')
         return set(s[i:i+2] for i in range(len(s) - 1))
-
     bg_a, bg_b = bigrams(a), bigrams(b)
     if not bg_a or not bg_b:
         return a in b or b in a, 0.5, "substring check"
-
     intersection = len(bg_a & bg_b)
     union        = len(bg_a | bg_b)
     sim          = intersection / union if union > 0 else 0.0
-
     if sim >= threshold:
         return True, sim, f"fuzzy match ({sim:.0%})"
     return False, sim, f"mismatch ({sim:.0%})"
@@ -634,45 +659,64 @@ def _names_match(ocr_name, qr_name, threshold=0.75):
 def _dobs_match(ocr_dob, qr_dob):
     if not ocr_dob or not qr_dob:
         return False, "one side empty"
-
     a = re.sub(r'[\-/\.]', '/', ocr_dob.strip())
     b = re.sub(r'[\-/\.]', '/', qr_dob.strip())
-
     if a == b:
         return True, "exact match"
-
-    parts_a = a.split('/')
-    parts_b = b.split('/')
-    if len(parts_a) == 3 and len(parts_b) == 3:
-        if parts_a[2] == parts_b[2]:
-            if parts_a[0] == parts_b[1] and parts_a[1] == parts_b[0]:
-                return True, "match (day/month order differs)"
-
-    return False, f"mismatch: OCR='{a}'  QR='{b}'"
+    pa, pb = a.split('/'), b.split('/')
+    if len(pa) == 3 and len(pb) == 3:
+        if pa[2] == pb[2] and pa[0] == pb[1] and pa[1] == pb[0]:
+            return True, "match (day/month swapped)"
+    return False, f"mismatch: OCR='{a}' QR='{b}'"
 
 
-def _aadhaar_nums_match(ocr_num, qr_data):
+def _pins_match(ocr_pin, qr_pin):
+    if not ocr_pin or not qr_pin:
+        return False, "one side empty"
+    a = re.sub(r'\D', '', str(ocr_pin).strip())
+    b = re.sub(r'\D', '', str(qr_pin).strip())
+    if a == b and len(a) == 6:
+        return True, f"exact match ({a})"
+    return False, f"mismatch: OCR='{a}' QR='{b}'"
+
+
+def _location_match(ocr_val, qr_val):
+    if not ocr_val or not qr_val:
+        return False, "one side empty"
+    a = ocr_val.strip().lower()
+    b = qr_val.strip().lower()
+    if a == b:
+        return True, "exact match"
+    if a in b or b in a:
+        return True, f"partial match ('{ocr_val}' ~ '{qr_val}')"
+    return False, f"mismatch: OCR='{ocr_val}' QR='{qr_val}'"
+
+
+def _aadhaar_nums_match(ocr_num, qr_fields):
     if not ocr_num:
         return False, "OCR number not found"
-
     ocr_digits = re.sub(r'\D', '', ocr_num)
 
-    qr_full = qr_data.get('aadhaar_number', '')
+    qr_full = qr_fields.get('aadhaar_number', '')
     if qr_full:
         qr_digits = re.sub(r'\D', '', qr_full)
         if len(qr_digits) == 12 and len(ocr_digits) == 12:
             if qr_digits == ocr_digits:
-                return True, "full 12-digit match ✓"
+                return True, "full 12-digit match"
             diffs = sum(a != b for a, b in zip(qr_digits, ocr_digits))
             if diffs == 1:
-                return True, "match with 1 OCR digit error (likely misread)"
-            return False, f"mismatch: OCR={ocr_digits}  QR={qr_digits}"
+                return True, "match with 1 OCR digit error"
+            return False, f"mismatch: OCR={ocr_digits} QR={qr_digits}"
 
-    qr_last4 = qr_data.get('aadhaar_last4', '')
+    qr_last4 = qr_fields.get('aadhaar_last4', '')
     if qr_last4 and len(ocr_digits) == 12:
         if ocr_digits[-4:] == qr_last4:
-            return True, f"last-4 match ({qr_last4}) ✓  [QR is masked]"
-        return False, f"last-4 mismatch: OCR ends {ocr_digits[-4:]}  QR={qr_last4}"
+            return True, f"last-4 match ({qr_last4}) [QR is masked]"
+        return False, f"last-4 mismatch: OCR={ocr_digits[-4:]} QR={qr_last4}"
+
+    # Secure QR intentionally omits Aadhaar number
+    if qr_fields.get('_format') == 'secure_qr':
+        return None, "Aadhaar# not stored in Secure QR (UIDAI privacy design)"
 
     return False, "QR has no Aadhaar number field"
 
@@ -685,26 +729,15 @@ def step18_qr_verify(image_path_or_array, ocr_fields):
     """
     Step 18 — QR Code Extraction & Cross-Verification.
 
-    Args:
-        image_path_or_array : path string or BGR numpy array
-        ocr_fields          : dict from step14_extract / step14b_correct
+    Supports Secure QR V2-V5 (post-2019) and Legacy XML/pipe/JSON.
+    Cross-checks: name, dob, gender, PIN, district, state.
 
-    Returns:
-        qr_result dict with keys:
-          qr_found         : bool
-          qr_decoded       : bool
-          qr_raw           : raw QR string (or None)
-          qr_fields        : parsed QR fields dict
-          qr_detect_source : which engine + variant found the QR
-          field_checks     : {field_name: {match, note}}
-          trust_score      : int 0–100
-          verdict          : str
-          fraud_signals    : list of str
+    Returns qr_result dict.
     """
     section("18 — QR Code Cross-Verification")
-    info("Scanning image for QR code (50+ preprocessing variants)...")
+    info("Scanning image for QR code (upscale + 50+ preprocessing variants)...")
 
-    # ── Load image ────────────────────────────────────────────
+    # Load image
     if isinstance(image_path_or_array, str):
         img_bgr = cv2.imread(image_path_or_array)
         if img_bgr is None:
@@ -713,15 +746,16 @@ def step18_qr_verify(image_path_or_array, ocr_fields):
         img_bgr = image_path_or_array
 
     qr_result = {
-        'qr_found':          False,
-        'qr_decoded':        False,
-        'qr_raw':            None,
-        'qr_fields':         {},
-        'qr_detect_source':  None,
-        'field_checks':      {},
-        'trust_score':       0,
-        'verdict':           'UNDETERMINED',
-        'fraud_signals':     [],
+        'qr_found':         False,
+        'qr_decoded':       False,
+        'qr_raw':           None,
+        'qr_fields':        {},
+        'qr_detect_source': None,
+        'qr_format':        None,
+        'field_checks':     {},
+        'trust_score':      0,
+        'verdict':          'UNDETERMINED',
+        'fraud_signals':    [],
     }
 
     if img_bgr is None:
@@ -729,51 +763,68 @@ def step18_qr_verify(image_path_or_array, ocr_fields):
         qr_result['verdict'] = 'UNDETERMINED (no image)'
         return qr_result
 
-    # ── Try QR detection ──────────────────────────────────────
+    # Try QR detection
     raw_qr = None
     source = None
 
-    # Engine 1: pyzbar (most robust — tries all 50+ variants)
     pyzbar_results = _detect_qr_pyzbar(img_bgr)
     if pyzbar_results:
         raw_qr, _, variant_label = pyzbar_results[0]
         source = f"pyzbar [{variant_label}]"
-        ok(f"QR detected by pyzbar  ({len(raw_qr)} bytes)  variant={variant_label}")
+        ok(f"QR detected by pyzbar ({len(raw_qr)} bytes) variant={variant_label}")
 
-    # Engine 2: OpenCV + WeChatQRCode (also tries all variants)
     if not raw_qr:
         raw_qr, _, variant_label = _detect_qr_opencv(img_bgr)
         if raw_qr:
             source = f"OpenCV [{variant_label}]"
-            ok(f"QR detected by OpenCV  ({len(raw_qr)} bytes)  variant={variant_label}")
+            ok(f"QR detected by OpenCV ({len(raw_qr)} bytes) variant={variant_label}")
 
+    # QR not found -> OCR-compensated score
     if not raw_qr:
         warn("No QR code detected after 50+ preprocessing variants")
-        warn("Possible reasons:")
-        warn("  • Back side of card not provided (QR is on the back)")
-        warn("  • Image resolution too low  (QR needs ≥ 150 DPI)")
-        warn("  • QR code region is physically damaged or covered")
-        warn("  • Digital screenshot / photocopy without QR embedded")
-        warn("  TIP: Install pyzbar for better detection:")
-        warn("       pip install pyzbar")
-        warn("       (Windows) pip install python-zxing")
-        warn("  TIP: Install opencv-contrib for WeChatQRCode:")
-        warn("       pip uninstall opencv-python")
-        warn("       pip install opencv-contrib-python")
+        warn("  * Make sure the back side of the card is provided")
+        warn("  * Image needs >= 150 DPI for dense Secure QR")
+        warn("  * pip install pyzbar  +  sudo apt install libzbar0")
+
+        ocr_score = 10
+        aadhaar = ocr_fields.get('aadhaar_number', '')
+        if aadhaar and re.match(r'^[2-9]\d{3}\s\d{4}\s\d{4}$', aadhaar.strip()):
+            ocr_score += 25
+            info("  OCR Aadhaar# format valid -> +25")
+        name = ocr_fields.get('name', '')
+        if name and len(name.strip()) >= 5 and re.match(r"^[A-Za-z\s.'\-]+$", name.strip()):
+            ocr_score += 15
+            info("  OCR Name plausible -> +15")
+        dob = ocr_fields.get('dob', '')
+        if dob and re.match(r'^\d{2}/\d{2}/\d{4}$', dob.strip()):
+            try:
+                d_v, m_v, y_v = dob.strip().split('/')
+                if 1 <= int(d_v) <= 31 and 1 <= int(m_v) <= 12 and 1900 <= int(y_v) <= 2025:
+                    ocr_score += 10
+                    info("  OCR DOB valid -> +10")
+            except ValueError:
+                pass
+        gender = ocr_fields.get('gender', '')
+        if gender and gender.strip().capitalize() in ('Male', 'Female', 'Transgender'):
+            ocr_score += 5
+            info("  OCR Gender valid -> +5")
+
+        ocr_score = min(ocr_score, 70)
+        info(f"  OCR-compensated trust score: {ocr_score}/70")
         qr_result['fraud_signals'].append(
-            "QR code not detected — cannot verify document authenticity"
-        )
-        qr_result['trust_score'] = 35
-        qr_result['verdict']     = 'REVIEW REQUIRED (QR not found)'
+            "QR not detected — score based on OCR field validation only")
+        qr_result['trust_score'] = ocr_score
+        qr_result['verdict'] = (
+            'REVIEW REQUIRED (QR unreadable — OCR fields valid)'
+            if ocr_score >= 55 else 'REVIEW REQUIRED (QR not found)')
         return qr_result
 
     qr_result['qr_found']         = True
-    qr_result['qr_raw']           = raw_qr
+    qr_result['qr_raw']           = (raw_qr.decode('utf-8', errors='replace')
+                                     if isinstance(raw_qr, bytes) else raw_qr)
     qr_result['qr_detect_source'] = source
-    info(f"QR source  : {source}")
-    info(f"QR snippet : {raw_qr[:120]}...")
 
-    # ── Parse QR payload ─────────────────────────────────────
+    # Parse QR payload
     info("Parsing QR payload...")
     qr_fields = _parse_aadhaar_qr(raw_qr)
     qr_result['qr_fields'] = qr_fields
@@ -781,122 +832,151 @@ def step18_qr_verify(image_path_or_array, ocr_fields):
     if not qr_fields:
         warn("QR found but payload could not be parsed")
         qr_result['fraud_signals'].append(
-            "QR code present but unreadable — structure may be altered"
-        )
+            "QR present but unreadable — structure may be altered")
         qr_result['trust_score'] = 40
         qr_result['verdict']     = 'REVIEW REQUIRED (QR unreadable)'
         return qr_result
 
     qr_result['qr_decoded'] = True
-    ok(f"QR decoded successfully — {len(qr_fields)} fields extracted")
-    for k, v in qr_fields.items():
-        if k != 'address_parts':
-            info(f"  QR.{k:<20}: {v}")
-    if 'address_parts' in qr_fields:
-        info(f"  QR.address         : {', '.join(qr_fields['address_parts'][:4])}...")
+    qr_result['qr_format']  = qr_fields.get('_format', 'unknown')
+    ok(f"QR decoded: format={qr_result['qr_format']}  "
+       f"name='{qr_fields.get('name','')}' "
+       f"dob='{qr_fields.get('dob','')}' "
+       f"pin='{qr_fields.get('pin','')}'")
 
-    # ── Cross-check fields ────────────────────────────────────
+    # Cross-check all fields
     print()
     info("Cross-checking QR fields against OCR fields...")
     print()
 
-    trust_score   = 20 + 10   # QR found (+20) + decoded (+10)
+    trust_score   = 10 + 10   # QR found + decoded
     field_checks  = {}
     fraud_signals = []
 
-    # ── Aadhaar Number ────────────────────────────────────────
-    aadhaar_match, aadhaar_note = _aadhaar_nums_match(
-        ocr_fields.get('aadhaar_number'), qr_fields
-    )
-    field_checks['aadhaar_number'] = {'match': aadhaar_match, 'note': aadhaar_note}
-    if aadhaar_match:
-        trust_score += 35
-        ok(f"  Aadhaar#  [MATCH  ] : {aadhaar_note}")
-    else:
-        print(f"  [XX]  Aadhaar#  [MISMATCH] : {aadhaar_note}")
-        fraud_signals.append(f"Aadhaar number mismatch — {aadhaar_note}")
+    def _check(label, pts, match, note, fraud_msg=None):
+        nonlocal trust_score
+        field_checks[label] = {'match': match, 'note': note}
+        if match is True:
+            trust_score += pts
+            ok(f"  {label:<18} [MATCH  +{pts}pt] : {note}")
+        elif match is False:
+            print(f"  [XX]  {label:<18} [MISMATCH] : {note}")
+            fraud_signals.append(fraud_msg or f"{label} mismatch — {note}")
+        else:
+            info(f"  {label:<18} [SKIP      ] : {note}")
 
-    # ── Name ──────────────────────────────────────────────────
+    # Name (+20)
     if qr_fields.get('name') and ocr_fields.get('name'):
-        name_match, name_sim, name_note = _names_match(
-            ocr_fields['name'], qr_fields['name']
-        )
-        field_checks['name'] = {'match': name_match, 'note': name_note}
-        if name_match:
-            trust_score += 20
-            ok(f"  Name      [MATCH  ] : OCR='{ocr_fields['name']}'  "
-               f"QR='{qr_fields['name']}'  ({name_note})")
-        else:
-            print(f"  [XX]  Name      [MISMATCH] : OCR='{ocr_fields['name']}'  "
-                  f"QR='{qr_fields['name']}'  ({name_note})")
-            fraud_signals.append(
-                f"Name mismatch — OCR: '{ocr_fields['name']}', "
-                f"QR: '{qr_fields['name']}' ({name_note})"
-            )
+        nm, _, nn = _names_match(ocr_fields['name'], qr_fields['name'])
+        _check('name', 20, nm, nn,
+               f"Name mismatch — OCR:'{ocr_fields['name']}' QR:'{qr_fields['name']}'")
     else:
-        field_checks['name'] = {'match': None, 'note': 'not available in QR'}
-        info("  Name      [SKIP   ] : QR name field not present")
+        _check('name', 20, None, 'not available')
 
-    # ── DOB ───────────────────────────────────────────────────
+    # DOB (+20)
     if qr_fields.get('dob') and ocr_fields.get('dob'):
-        dob_match, dob_note = _dobs_match(ocr_fields['dob'], qr_fields['dob'])
-        field_checks['dob'] = {'match': dob_match, 'note': dob_note}
-        if dob_match:
-            trust_score += 10
-            ok(f"  DOB       [MATCH  ] : {dob_note}  "
-               f"OCR='{ocr_fields['dob']}'  QR='{qr_fields['dob']}'")
-        else:
-            print(f"  [XX]  DOB       [MISMATCH] : {dob_note}")
-            fraud_signals.append(f"DOB mismatch — {dob_note}")
+        dm, dn = _dobs_match(ocr_fields['dob'], qr_fields['dob'])
+        _check('dob', 20, dm, dn,
+               f"DOB mismatch — OCR:'{ocr_fields['dob']}' QR:'{qr_fields['dob']}'")
     else:
-        field_checks['dob'] = {'match': None, 'note': 'not available in QR'}
-        info("  DOB       [SKIP   ] : QR DOB field not present")
+        _check('dob', 20, None, 'not available')
 
-    # ── Gender ────────────────────────────────────────────────
+    # Gender (+10)
     if qr_fields.get('gender') and ocr_fields.get('gender'):
-        qr_gen  = qr_fields['gender'].capitalize()
-        ocr_gen = ocr_fields['gender'].capitalize()
-        gen_match = (qr_gen == ocr_gen)
-        field_checks['gender'] = {
-            'match': gen_match,
-            'note':  'match' if gen_match else f"OCR='{ocr_gen}'  QR='{qr_gen}'"
-        }
-        if gen_match:
-            trust_score += 5
-            ok(f"  Gender    [MATCH  ] : '{qr_gen}'")
-        else:
-            print(f"  [XX]  Gender    [MISMATCH] : OCR='{ocr_gen}'  QR='{qr_gen}'")
-            fraud_signals.append(
-                f"Gender mismatch — OCR: '{ocr_gen}', QR: '{qr_gen}'"
-            )
+        qg = qr_fields['gender'].capitalize()
+        og = ocr_fields['gender'].capitalize()
+        gm = (qg == og)
+        _check('gender', 10, gm,
+               'match' if gm else f"OCR='{og}' QR='{qg}'")
     else:
-        field_checks['gender'] = {'match': None, 'note': 'not available in QR'}
-        info("  Gender    [SKIP   ] : QR gender field not present")
+        _check('gender', 10, None, 'not available')
 
-    # ── Clamp & verdict ───────────────────────────────────────
+    # PIN (+10)
+    if qr_fields.get('pin') and ocr_fields.get('address_pin'):
+        pm, pn = _pins_match(ocr_fields['address_pin'], qr_fields['pin'])
+        _check('pin', 10, pm, pn,
+               f"PIN mismatch — OCR:'{ocr_fields['address_pin']}' QR:'{qr_fields['pin']}'")
+    else:
+        _check('pin', 10, None, 'not available in QR or OCR')
+
+    # District (+10)
+    qr_dist  = qr_fields.get('district') or qr_fields.get('district2', '')
+    ocr_dist = ocr_fields.get('address_district', '')
+    if qr_dist and ocr_dist:
+        lm, ln = _location_match(ocr_dist, qr_dist)
+        _check('district', 10, lm, ln,
+               f"District mismatch — OCR:'{ocr_dist}' QR:'{qr_dist}'")
+    else:
+        _check('district', 10, None, 'not available in QR or OCR')
+
+    # State (+10)
+    if qr_fields.get('state') and ocr_fields.get('address_state'):
+        sm, sn = _location_match(ocr_fields['address_state'], qr_fields['state'])
+        _check('state', 10, sm, sn,
+               f"State mismatch — OCR:'{ocr_fields['address_state']}' QR:'{qr_fields['state']}'")
+    else:
+        _check('state', 10, None, 'not available in QR or OCR')
+
+    # Aadhaar# — only meaningful for legacy XML QR
+    aadhaar_match, aadhaar_note = _aadhaar_nums_match(
+        ocr_fields.get('aadhaar_number'), qr_fields)
+    field_checks['aadhaar_number'] = {'match': aadhaar_match, 'note': aadhaar_note}
+    if aadhaar_match is True:
+        ok(f"  {'aadhaar_number':<18} [MATCH     ] : {aadhaar_note}")
+    elif aadhaar_match is False:
+        warn(f"  {'aadhaar_number':<18} [INFO      ] : {aadhaar_note}")
+    else:
+        info(f"  {'aadhaar_number':<18} [SKIP      ] : {aadhaar_note}")
+
+    # Clamp & verdict
     trust_score = min(trust_score, 100)
     qr_result['trust_score']   = trust_score
     qr_result['field_checks']  = field_checks
     qr_result['fraud_signals'] = fraud_signals
 
-    if trust_score >= 80:
-        verdict = "LIKELY GENUINE ✓"
-    elif trust_score >= 50:
-        verdict = "REVIEW REQUIRED ⚠"
-    else:
-        verdict = "FRAUD SUSPECTED ✗"
-
+    verdict = ("LIKELY GENUINE ✓"   if trust_score >= 80 else
+               "REVIEW REQUIRED ⚠"  if trust_score >= 50 else
+               "FRAUD SUSPECTED ✗")
     qr_result['verdict'] = verdict
 
+    # Summary printout
     print()
-    print(f"  {'─'*54}")
+    print(f"  {'─'*56}")
+    print(f"  QR Format      : {qr_result['qr_format']}")
     print(f"  Trust Score    : {trust_score}/100")
     print(f"  Verdict        : {verdict}")
     print(f"  Detect source  : {source}")
+    print()
+    print("  ── All QR fields decoded ──")
+    display_keys = [
+        ('name',          'Name'),
+        ('dob',           'Date of Birth'),
+        ('gender',        'Gender'),
+        ('building',      'Building'),
+        ('street',        'Street'),
+        ('landmark',      'Landmark'),
+        ('locality',      'Locality'),
+        ('vtc',           'VTC / Sub-district'),
+        ('subdistrict',   'Sub-district'),
+        ('district',      'District'),
+        ('state',         'State'),
+        ('pin',           'PIN Code'),
+        ('care_of',       'Care Of (C/O)'),
+        ('mobile_masked', 'Mobile (masked)'),
+        ('mobile_last4',  'Mobile last 4'),
+        ('reference_id',  'Reference ID'),
+        ('qr_version',    'QR Version'),
+    ]
+    for key, label in display_keys:
+        val = qr_fields.get(key, '')
+        if val:
+            print(f"  {label:<22}: {val}")
+
     if fraud_signals:
+        print()
         print(f"  Fraud Signals ({len(fraud_signals)}):")
         for sig in fraud_signals:
-            print(f"    ⚠  {sig}")
-    print(f"  {'─'*54}")
+            print(f"    * {sig}")
+    print(f"  {'─'*56}")
 
     return qr_result

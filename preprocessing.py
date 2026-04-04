@@ -412,18 +412,6 @@ def step9_adaptive_sharpen(gray):
 
 
 # ─────────────────────────────────────────────────────────────
-#  STEP 9 — Sharpen
-# ─────────────────────────────────────────────────────────────
-
-def step9_sharpen(gray):
-    section("9 — Sharpen")
-    blurred   = cv2.GaussianBlur(gray, (0, 0), sigmaX=2)
-    sharpened = cv2.addWeighted(gray, 1.9, blurred, -0.9, 0)
-    ok("Unsharp mask  (weight=1.9, blur=-0.9, sigma=2)")
-    return sharpened
-
-
-# ─────────────────────────────────────────────────────────────
 #  STEP 10 — Binarize (two variants kept separately)
 # ─────────────────────────────────────────────────────────────
 
