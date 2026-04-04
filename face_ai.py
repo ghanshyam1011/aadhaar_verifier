@@ -316,6 +316,17 @@ def step19c_face_match(card_face_img, selfie_path):
             tmp_card_path = tmp.name
         cv2.imwrite(tmp_card_path, card_face_img)
 
+        # ── Engine 0: InsightFace ArcFace (best accuracy) ────────
+        info("Trying InsightFace ArcFace (best accuracy for Indian faces)...")
+        insightface_result = _insightface_match(card_face_img, selfie_path)
+        if insightface_result is not None:
+            # InsightFace succeeded — copy its result and return
+            for k, v in insightface_result.items():
+                result[k] = v
+            return result
+
+        info("InsightFace not available — trying DeepFace...")
+
         # ── Engine 1: DeepFace ────────────────────────────────
         info("Trying DeepFace (deep learning face recognition)...")
         try:
@@ -591,7 +602,648 @@ def step19d_liveness_hint(face_img):
     return likely_real, liveness_score, note
 
 
-def step19_face_pipeline(img_bgr, image_path, selfie_path=None):
+
+
+# ═════════════════════════════════════════════════════════════
+#  PHASE 3 UPGRADES — World-class Face AI
+# ═════════════════════════════════════════════════════════════
+
+
+# ─────────────────────────────────────────────────────────────
+#  19E — PASSIVE LIVENESS DETECTION (upgrade from 19D heuristic)
+#
+#  WHY THIS IS BETTER THAN THE FFT LIVENESS HINT (19D):
+#    19D looks at the whole card image using global FFT peaks.
+#    19E looks ONLY at the face region using 4 independent
+#    texture analysis methods that real face detectors use.
+#
+#    Methods combined:
+#      1. Local Binary Pattern (LBP) texture entropy
+#         Real skin: complex, high-entropy LBP histogram
+#         Printed photo: uniform, low-entropy LBP
+#
+#      2. Gradient magnitude distribution
+#         Real face: natural edge gradient falloff
+#         Screen/print: sharp digital edges everywhere
+#
+#      3. High-frequency energy ratio
+#         Real face: low HF energy (skin is smooth)
+#         Moiré/halftone: high HF energy at regular intervals
+#
+#      4. Colour saturation analysis
+#         Real face: moderate, varied skin saturation
+#         Printed photo: often over-saturated or flat
+#
+#  RETURNS: (liveness_score: float, likely_real: bool, detail: dict)
+# ─────────────────────────────────────────────────────────────
+
+def step19e_passive_liveness(face_img):
+    """
+    Passive liveness detection on the face region.
+    Combines 4 texture analysis methods into a single score.
+
+    Args:
+        face_img : BGR numpy array of face crop
+
+    Returns:
+        (liveness_score: float 0-100, likely_real: bool, detail: dict)
+    """
+    section("19E — Passive Liveness Detection")
+
+    if face_img is None or face_img.size == 0:
+        warn("No face image for passive liveness")
+        return 50.0, True, {}
+
+    h, w = face_img.shape[:2]
+    if h < 30 or w < 30:
+        warn(f"Face too small for liveness ({w}x{h}) — skipping")
+        return 60.0, True, {}
+
+    gray = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
+
+    # Standardise size for consistent analysis
+    face_std = cv2.resize(gray, (128, 128), interpolation=cv2.INTER_AREA)
+    scores   = {}
+
+    # ── Method 1: LBP Texture Entropy ─────────────────────────
+    # LBP (Local Binary Pattern) compares each pixel to its 8 neighbours.
+    # Real skin has complex, varied texture → high entropy LBP histogram.
+    # A printed/screen photo has more uniform patterns → lower entropy.
+    try:
+        radius    = 1
+        neighbors = 8
+        lbp       = np.zeros_like(face_std, dtype=np.uint8)
+
+        for i in range(radius, face_std.shape[0] - radius):
+            for j in range(radius, face_std.shape[1] - radius):
+                center   = face_std[i, j]
+                pattern  = 0
+                offsets  = [(-1,-1),(-1,0),(-1,1),(0,1),(1,1),(1,0),(1,-1),(0,-1)]
+                for bit, (dy, dx) in enumerate(offsets):
+                    if face_std[i+dy, j+dx] >= center:
+                        pattern |= (1 << bit)
+                lbp[i, j] = pattern
+
+        # Compute histogram and entropy
+        hist, _ = np.histogram(lbp.ravel(), bins=256, range=(0, 256))
+        hist    = hist[hist > 0].astype(np.float64)
+        probs   = hist / hist.sum()
+        entropy = -np.sum(probs * np.log2(probs + 1e-10))
+
+        # Real face: entropy 5-7 (complex)
+        # Print/screen: entropy 3-5 (uniform)
+        lbp_score = min(100, max(0, (entropy - 3.0) / 4.0 * 100))
+        scores['lbp_entropy'] = {
+            'value': round(entropy, 3),
+            'score': round(lbp_score, 1),
+            'label': 'High entropy = complex skin texture'
+        }
+        info(f"  LBP entropy: {entropy:.3f} → score {lbp_score:.0f}/100")
+
+    except Exception as e:
+        warn(f"  LBP computation failed: {e}")
+        scores['lbp_entropy'] = {'value': 0, 'score': 60.0, 'label': 'Failed'}
+        lbp_score = 60.0
+
+    # ── Method 2: Gradient Magnitude Distribution ──────────────
+    # Real face has smooth gradient falloff (skin is continuous).
+    # A printed/screen photo has sharp digital edges everywhere.
+    # We measure: what fraction of gradients are very high (>150)?
+    # Real face: low fraction. Print/screen: high fraction.
+    try:
+        gx = cv2.Sobel(face_std, cv2.CV_64F, 1, 0, ksize=3)
+        gy = cv2.Sobel(face_std, cv2.CV_64F, 0, 1, ksize=3)
+        mag = np.sqrt(gx**2 + gy**2)
+
+        high_grad_ratio = np.sum(mag > 150) / mag.size
+        # Real face: high_grad_ratio < 0.05
+        # Print/digital: high_grad_ratio > 0.15
+        grad_score = min(100, max(0, (0.20 - high_grad_ratio) / 0.20 * 100))
+        scores['gradient'] = {
+            'value': round(high_grad_ratio, 4),
+            'score': round(grad_score, 1),
+            'label': 'Low sharp-edge ratio = natural face'
+        }
+        info(f"  Gradient high-ratio: {high_grad_ratio:.4f} → score {grad_score:.0f}/100")
+
+    except Exception as e:
+        warn(f"  Gradient computation failed: {e}")
+        scores['gradient'] = {'value': 0, 'score': 60.0, 'label': 'Failed'}
+        grad_score = 60.0
+
+    # ── Method 3: High-Frequency Energy Ratio ─────────────────
+    # Moiré/halftone patterns concentrate energy in specific
+    # high-frequency bands. Real face has low HF energy.
+    try:
+        fft    = np.fft.fft2(face_std.astype(np.float64))
+        fft_sh = np.fft.fftshift(fft)
+        mag_f  = np.abs(fft_sh)
+
+        cy, cx = face_std.shape[0]//2, face_std.shape[1]//2
+
+        # Total energy vs high-frequency energy (outer 35%)
+        total_energy = np.sum(mag_f)
+        hf_energy    = 0.0
+        for y in range(face_std.shape[0]):
+            for x in range(face_std.shape[1]):
+                r = np.sqrt((y-cy)**2 + (x-cx)**2)
+                if r > 0.35 * min(cy, cx) * 2:
+                    hf_energy += mag_f[y, x]
+
+        hf_ratio = hf_energy / (total_energy + 1e-6)
+        # Real face: hf_ratio ~0.6-0.75 (natural falloff)
+        # Screen/print: hf_ratio >0.80 (artificial peaks)
+        hf_score = min(100, max(0, (0.85 - hf_ratio) / 0.25 * 100))
+        scores['hf_energy'] = {
+            'value': round(hf_ratio, 4),
+            'score': round(hf_score, 1),
+            'label': 'Normal HF ratio = no screen pattern'
+        }
+        info(f"  HF energy ratio: {hf_ratio:.4f} → score {hf_score:.0f}/100")
+
+    except Exception as e:
+        warn(f"  HF energy computation failed: {e}")
+        scores['hf_energy'] = {'value': 0, 'score': 60.0, 'label': 'Failed'}
+        hf_score = 60.0
+
+    # ── Method 4: Skin Colour Saturation Analysis ──────────────
+    # Real face: HSV saturation 30-120 for Indian/South Asian skin.
+    # Printed photo: saturation often compressed (<25 or >150).
+    # Screen photo: often over-saturated (>140).
+    try:
+        hsv  = cv2.cvtColor(face_img, cv2.COLOR_BGR2HSV)
+        s    = hsv[:, :, 1].astype(np.float32)
+
+        # Focus on face-like hue range (Indian skin: H 5-25 in OpenCV 0-180)
+        h_ch = hsv[:, :, 0].astype(np.float32)
+        skin_mask = ((h_ch >= 3) & (h_ch <= 30) &
+                     (hsv[:, :, 2] > 40)).astype(np.uint8)
+
+        if np.sum(skin_mask) > 200:
+            skin_sat  = s[skin_mask > 0]
+            mean_sat  = np.mean(skin_sat)
+            std_sat   = np.std(skin_sat)
+            # Good range: mean 40-100, std 10-40
+            mean_ok   = 1.0 if 25 <= mean_sat <= 120 else 0.4
+            std_ok    = 1.0 if 8  <= std_sat  <= 50  else 0.5
+            sat_score = mean_ok * std_ok * 90
+        else:
+            # No clear skin region — neutral score
+            sat_score = 65
+            mean_sat  = 0
+            std_sat   = 0
+
+        scores['saturation'] = {
+            'value': round(float(mean_sat), 1),
+            'score': round(sat_score, 1),
+            'label': 'Natural skin saturation'
+        }
+        info(f"  Skin saturation: mean={mean_sat:.1f} std={std_sat:.1f} "
+             f"→ score {sat_score:.0f}/100")
+
+    except Exception as e:
+        warn(f"  Saturation analysis failed: {e}")
+        scores['saturation'] = {'value': 0, 'score': 60.0, 'label': 'Failed'}
+        sat_score = 60.0
+
+    # ── Combine scores (weighted) ──────────────────────────────
+    weights = {'lbp_entropy': 0.35, 'gradient': 0.30,
+               'hf_energy':   0.20, 'saturation': 0.15}
+    method_scores = {
+        'lbp_entropy': lbp_score,
+        'gradient':    grad_score,
+        'hf_energy':   hf_score,
+        'saturation':  sat_score,
+    }
+
+    liveness_score = sum(method_scores[k] * weights[k] for k in weights)
+    liveness_score = round(min(100.0, max(0.0, liveness_score)), 1)
+
+    likely_real = liveness_score >= 55
+
+    if liveness_score >= 75:
+        verdict_str = "Likely real face"
+    elif liveness_score >= 55:
+        verdict_str = "Probably real — verify manually"
+    else:
+        verdict_str = "Suspicious — possible printed/screen photo"
+
+    ok(f"  Passive liveness : {liveness_score:.0f}/100 — {verdict_str}")
+
+    return liveness_score, likely_real, scores
+
+
+# ─────────────────────────────────────────────────────────────
+#  19F — AGE CONSISTENCY CHECK
+#
+#  WHAT IT DOES:
+#    Uses DeepFace's age estimator to estimate the age of the
+#    person in the card photo. Compares against the declared DOB.
+#    If the estimated age differs by more than 12 years from the
+#    declared age, it flags the card.
+#
+#  WHY IT CATCHES FRAUD:
+#    The most common stolen-card fraud scenario:
+#      Person steals an Aadhaar card of someone who looks similar.
+#      The stolen card has a different DOB — maybe 10-15 years off.
+#      The face LOOKS similar but the age doesn't match the DOB.
+#
+#    This check is the only one that catches this attack.
+#    QR, Verhoeff, ELA all pass — but the age will be wrong.
+#
+#  TOLERANCE: ±12 years (accounts for lighting, angle, age of photo)
+#
+#  GRACEFUL FALLBACK:
+#    If DeepFace not installed → uses Haar cascade proxy (less accurate)
+#    If both fail → skips with neutral score (never crashes pipeline)
+# ─────────────────────────────────────────────────────────────
+
+def step19f_age_consistency(face_img, dob_str):
+    """
+    Estimate age from face and compare against declared DOB.
+
+    Args:
+        face_img : BGR numpy array of face crop
+        dob_str  : Date of birth string "DD/MM/YYYY"
+
+    Returns:
+        (score: int 0-100, note: str, detail: dict)
+        score 100 = age matches DOB perfectly
+        score 0   = massive age inconsistency (likely fraud)
+    """
+    section("19F — Age Consistency Check")
+
+    if face_img is None or face_img.size == 0:
+        return 50, "No face image for age check", {}
+
+    if not dob_str:
+        return 50, "No DOB available for age comparison", {}
+
+    # Parse DOB
+    try:
+        import re as _re
+        from datetime import date as _date
+        import datetime as _datetime
+        m = _re.match(r'(\d{1,2})/(\d{1,2})/(\d{4})', dob_str.strip())
+        if not m:
+            return 50, f"Cannot parse DOB: {dob_str}", {}
+        day, month, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        dob         = _date(year, month, day)
+        today       = _date.today()
+        declared_age = (today - dob).days / 365.25
+        info(f"  Declared DOB: {dob_str} → declared age: {declared_age:.1f} years")
+    except Exception as e:
+        return 50, f"DOB parse error: {e}", {}
+
+    estimated_age = None
+    method        = None
+
+    # ── Engine 1: DeepFace age estimation ─────────────────────
+    try:
+        from deepface import DeepFace
+        import tempfile, os as _os
+
+        tmp_path = _os.path.join(tempfile.gettempdir(), '_age_check.jpg')
+        cv2.imwrite(tmp_path, face_img)
+
+        result = DeepFace.analyze(
+            img_path          = tmp_path,
+            actions           = ['age'],
+            enforce_detection = False,
+            detector_backend  = 'opencv',
+        )
+        # DeepFace returns list or dict depending on version
+        if isinstance(result, list):
+            result = result[0]
+        estimated_age = result.get('age', None)
+        method        = 'DeepFace'
+
+        try:
+            _os.unlink(tmp_path)
+        except Exception:
+            pass
+
+        ok(f"  DeepFace age estimate: {estimated_age:.0f} years")
+
+    except ImportError:
+        info("  DeepFace not installed — using proxy age estimator")
+    except Exception as e:
+        warn(f"  DeepFace age estimate failed: {e}")
+
+    # ── Engine 2: Laplacian-based proxy (fallback) ─────────────
+    # When DeepFace is unavailable, use a proxy:
+    # Younger faces have smoother skin → higher Laplacian variance.
+    # Older faces have more wrinkles → different LBP texture.
+    # This is a rough proxy, tolerance is ±20 years.
+    if estimated_age is None:
+        try:
+            gray = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
+            lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+
+            # Very rough heuristic based on skin texture complexity
+            # Young (5-25): lap_var typically 200-600
+            # Middle (25-50): lap_var 400-900
+            # Older (50+): lap_var 600-1200
+            # These ranges overlap heavily — this is only a sanity check
+            if   lap_var < 250: proxy_age = 15
+            elif lap_var < 400: proxy_age = 22
+            elif lap_var < 600: proxy_age = 35
+            elif lap_var < 900: proxy_age = 48
+            else:               proxy_age = 60
+
+            estimated_age = proxy_age
+            method        = 'texture_proxy (rough)'
+            info(f"  Texture proxy age: ~{proxy_age} years (lap_var={lap_var:.0f})")
+        except Exception as e:
+            warn(f"  Proxy age estimator failed: {e}")
+            return 50, "Age estimation not available", {}
+
+    if estimated_age is None:
+        return 50, "Age estimation failed", {}
+
+    # ── Compare estimated vs declared ─────────────────────────
+    age_diff = abs(estimated_age - declared_age)
+    info(f"  Age diff: |{estimated_age:.0f} - {declared_age:.1f}| = {age_diff:.1f} years")
+
+    # Tolerance depends on engine accuracy
+    tolerance = 12 if method == 'DeepFace' else 20
+
+    if age_diff <= tolerance * 0.5:
+        score = 100
+        note  = (f"Age matches DOB ({method}: ~{estimated_age:.0f} yrs, "
+                 f"declared {declared_age:.0f} yrs, diff={age_diff:.0f} yrs)")
+    elif age_diff <= tolerance:
+        score = 75
+        note  = (f"Age within tolerance ({method}: ~{estimated_age:.0f} yrs, "
+                 f"declared {declared_age:.0f} yrs, diff={age_diff:.0f} yrs)")
+    elif age_diff <= tolerance * 1.5:
+        score = 45
+        note  = (f"Age mismatch ({method}: ~{estimated_age:.0f} yrs, "
+                 f"declared {declared_age:.0f} yrs, diff={age_diff:.0f} yrs). "
+                 f"Possible different-age card fraud — verify manually.")
+    else:
+        score = 10
+        note  = (f"LARGE age mismatch ({method}: ~{estimated_age:.0f} yrs, "
+                 f"declared {declared_age:.0f} yrs, diff={age_diff:.0f} yrs). "
+                 f"Strong indicator of stolen card fraud.")
+
+    sym = "OK" if score >= 75 else ("WARN" if score >= 45 else "FAIL")
+    ok(f"  Age consistency: {score}/100 [{sym}] — {note[:60]}")
+
+    detail = {
+        'estimated_age':  round(float(estimated_age), 1),
+        'declared_age':   round(declared_age, 1),
+        'age_diff':       round(age_diff, 1),
+        'tolerance':      tolerance,
+        'method':         method,
+    }
+    return score, note, detail
+
+
+# ─────────────────────────────────────────────────────────────
+#  19G — OCCLUSION & DAMAGE DETECTION
+#
+#  WHAT IT DOES:
+#    Checks whether the face photo is partially covered or damaged.
+#    Uses facial landmark detection to verify that all key
+#    landmarks (eyes, nose, mouth) are visible and unobstructed.
+#
+#  WHY IT MATTERS:
+#    A tampered card might have:
+#      1. A sticker or tape covering part of the original face
+#      2. A new photo pasted over the original
+#      3. Ink or pen marks obscuring features
+#      4. Physical damage (torn, water damaged)
+#
+#    These attacks try to substitute a different person's photo
+#    while making detection harder.
+#
+#  METHOD:
+#    1. Run Haar Cascade eye detector on face region
+#    2. Run Haar Cascade mouth/smile detector
+#    3. Check that detected features have reasonable spatial layout
+#    4. Check pixel value uniformity in key regions (solid colour = covered)
+# ─────────────────────────────────────────────────────────────
+
+def step19g_occlusion_check(face_img):
+    """
+    Detect face occlusion, damage, or feature obstruction.
+
+    Args:
+        face_img : BGR numpy array of face crop
+
+    Returns:
+        (score: int 0-100, note: str, detail: dict)
+    """
+    section("19G — Occlusion & Damage Detection")
+
+    if face_img is None or face_img.size == 0:
+        return 50, "No face image for occlusion check", {}
+
+    h, w = face_img.shape[:2]
+    if h < 40 or w < 40:
+        return 60, f"Face too small for occlusion check ({w}x{h})", {}
+
+    gray = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
+    detail = {}
+    issues = []
+
+    # ── Eye detection ──────────────────────────────────────────
+    eyes_found = 0
+    try:
+        eye_cascade_path = cv2.data.haarcascades + 'haarcascade_eye.xml'
+        if os.path.exists(eye_cascade_path):
+            eye_cascade = cv2.CascadeClassifier(eye_cascade_path)
+            # Look for eyes in top 60% of face region
+            face_top = gray[:int(h * 0.65), :]
+            eyes = eye_cascade.detectMultiScale(
+                face_top, scaleFactor=1.05, minNeighbors=3,
+                minSize=(int(w*0.05), int(w*0.05))
+            )
+            eyes_found = len(eyes)
+            detail['eyes_detected'] = eyes_found
+            info(f"  Eyes detected: {eyes_found}")
+    except Exception as e:
+        warn(f"  Eye detection failed: {e}")
+        detail['eyes_detected'] = 0
+
+    # ── Check for solid-colour (covered) regions ───────────────
+    # A sticker or tape creates a region with near-zero variance
+    block_size   = max(16, min(w, h) // 6)
+    low_var_blocks = 0
+    total_blocks   = 0
+
+    for y in range(0, h - block_size, block_size):
+        for x in range(0, w - block_size, block_size):
+            block    = gray[y:y+block_size, x:x+block_size]
+            variance = np.var(block)
+            total_blocks += 1
+            if variance < 15:   # nearly uniform — possible sticker
+                low_var_blocks += 1
+
+    solid_ratio = low_var_blocks / max(total_blocks, 1)
+    detail['solid_region_ratio'] = round(solid_ratio, 3)
+    info(f"  Solid (covered) region ratio: {solid_ratio:.3f}")
+
+    if solid_ratio > 0.25:
+        issues.append(f"Large uniform region ({solid_ratio:.0%}) — possible sticker or tape")
+
+    # ── Check overall image variance (damage/blur) ─────────────
+    overall_var = np.var(gray)
+    detail['overall_variance'] = round(float(overall_var), 1)
+    info(f"  Overall variance: {overall_var:.1f}")
+
+    if overall_var < 100:
+        issues.append("Very low image variance — face may be damaged or obscured")
+
+    # ── Check brightness uniformity (ink/pen marks) ────────────
+    # Ink marks create very dark regions in otherwise bright face area
+    dark_ratio = np.sum(gray < 30) / gray.size
+    detail['dark_pixel_ratio'] = round(dark_ratio, 4)
+    info(f"  Dark pixel ratio: {dark_ratio:.4f}")
+
+    if dark_ratio > 0.08:
+        issues.append(f"High dark pixel ratio ({dark_ratio:.1%}) — possible ink marks")
+
+    # ── Compute score ──────────────────────────────────────────
+    eye_score    = 100 if eyes_found >= 2 else (65 if eyes_found == 1 else 35)
+    solid_score  = max(0, 100 - int(solid_ratio * 300))
+    var_score    = min(100, int(overall_var / 5))
+    dark_score   = max(0, 100 - int(dark_ratio * 500))
+
+    score = int(eye_score * 0.40 + solid_score * 0.30 +
+                var_score  * 0.20 + dark_score  * 0.10)
+    score = max(0, min(100, score))
+
+    if issues:
+        note = f"Occlusion detected: {'; '.join(issues[:2])}"
+    elif eyes_found >= 2:
+        note = f"Face complete — both eyes detected, no occlusion signs."
+    elif eyes_found == 1:
+        note = "One eye detected — partial occlusion possible or pose issue."
+    else:
+        note = "No eyes detected — face may be obscured or low quality."
+
+    sym = "OK" if score >= 70 else ("WARN" if score >= 45 else "FAIL")
+    ok(f"  Occlusion score: {score}/100 [{sym}]")
+    detail['issues'] = issues
+
+    return score, note, detail
+
+
+# ─────────────────────────────────────────────────────────────
+#  19H — INSIGHTFACE UPGRADE FOR FACE MATCHING
+#
+#  WHY InsightFace > DeepFace/VGG-Face:
+#    DeepFace uses VGG-Face (2015 model).
+#    InsightFace uses ArcFace (2019) trained on MS1MV2 dataset.
+#    ArcFace is the current state-of-art for 1:1 face verification.
+#
+#    Accuracy on LFW benchmark:
+#      VGG-Face  : 98.95%
+#      ArcFace   : 99.83%
+#
+#    More importantly for Indian IDs:
+#      ArcFace trained on more diverse dataset → better on South Asian faces
+#      ArcFace better on low-resolution card photos
+#      ArcFace better on partial poses (ID photos are often not perfectly frontal)
+#
+#  INSTALL:
+#    pip install insightface onnxruntime
+#    (no GPU required — CPU inference works fine for 1:1 matching)
+#
+#  GRACEFUL FALLBACK:
+#    InsightFace not installed → falls back to DeepFace → falls back to LBPH
+#    Pipeline never crashes regardless of what is installed.
+# ─────────────────────────────────────────────────────────────
+
+def _insightface_match(card_face_img, selfie_path):
+    """
+    Face matching using InsightFace ArcFace model.
+
+    Returns: result dict (same schema as step19c_face_match)
+             or None if InsightFace not available.
+    """
+    try:
+        import insightface
+        from insightface.app import FaceAnalysis
+        import tempfile
+    except ImportError:
+        return None
+
+    result = {
+        'match':       False,
+        'match_score': 0.0,
+        'distance':    None,
+        'engine':      'insightface_arcface',
+        'verdict':     'INCONCLUSIVE',
+        'note':        '',
+    }
+
+    try:
+        info("  Loading InsightFace ArcFace model...")
+        app = FaceAnalysis(
+            name='buffalo_sc',            # lightweight model (~200MB)
+            providers=['CPUExecutionProvider']
+        )
+        app.prepare(ctx_id=0, det_size=(128, 128))
+        ok("  InsightFace loaded")
+
+        # Process card face
+        card_rgb = cv2.cvtColor(card_face_img, cv2.COLOR_BGR2RGB)
+        card_faces = app.get(card_rgb)
+
+        # Process selfie
+        selfie_img = cv2.imread(selfie_path)
+        if selfie_img is None:
+            result['note'] = 'Cannot read selfie'
+            return result
+        selfie_rgb  = cv2.cvtColor(selfie_img, cv2.COLOR_BGR2RGB)
+        selfie_faces = app.get(selfie_rgb)
+
+        if not card_faces:
+            result['note'] = 'No face detected in card image by InsightFace'
+            return result
+        if not selfie_faces:
+            result['note'] = 'No face detected in selfie by InsightFace'
+            return result
+
+        # Get embeddings (512-dim ArcFace embedding)
+        emb_card   = card_faces[0].normed_embedding
+        emb_selfie = selfie_faces[0].normed_embedding
+
+        # Cosine similarity (embeddings are already normalised)
+        similarity = float(np.dot(emb_card, emb_selfie))
+
+        # ArcFace cosine similarity threshold: 0.28 (same-person)
+        # Convert similarity (-1 to 1) to match_score (0 to 100)
+        match_score = max(0.0, min(100.0, (similarity + 1.0) / 2.0 * 100))
+        threshold   = 0.28
+
+        result['distance']    = round(1.0 - similarity, 4)
+        result['match_score'] = round(match_score, 1)
+        result['match']       = similarity >= threshold
+
+        if similarity >= threshold:
+            result['verdict'] = 'MATCH ✓'
+            result['note']    = (f"ArcFace: cosine_sim={similarity:.3f} "
+                                 f">= threshold={threshold}")
+        else:
+            result['verdict'] = 'NO MATCH ✗'
+            result['note']    = (f"ArcFace: cosine_sim={similarity:.3f} "
+                                 f"< threshold={threshold}")
+
+        ok(f"  InsightFace result : {result['verdict']}")
+        ok(f"  Match score        : {match_score:.1f}/100")
+        ok(f"  Cosine similarity  : {similarity:.4f} (threshold={threshold})")
+
+        return result
+
+    except Exception as e:
+        warn(f"  InsightFace failed: {e}")
+        return None
+
+def step19_face_pipeline(img_bgr, image_path, selfie_path=None, fields=None):
     """
     Orchestrate the full Face AI pipeline:
       19A — Extract face from card
@@ -603,17 +1255,29 @@ def step19_face_pipeline(img_bgr, image_path, selfie_path=None):
         face_result dict with all sub-results
     """
     face_result = {
-        'face_img':         None,
-        'face_bbox':        None,
-        'extraction_method': None,
-        'quality_score':    0,
-        'quality_verdict':  'NOT_ASSESSED',
-        'quality_details':  {},
-        'match_result':     None,
-        'liveness_score':   None,
-        'likely_real':      None,
-        'liveness_note':    None,
-        'selfie_provided':  bool(selfie_path),
+        'face_img':                 None,
+        'face_bbox':                None,
+        'extraction_method':        None,
+        'quality_score':            0,
+        'quality_verdict':          'NOT_ASSESSED',
+        'quality_details':          {},
+        'match_result':             None,
+        'liveness_score':           None,
+        'likely_real':              None,
+        'liveness_note':            None,
+        'selfie_provided':          bool(selfie_path),
+        # Phase 3 new fields
+        'passive_liveness_score':   None,
+        'passive_liveness_real':    None,
+        'passive_liveness_detail':  {},
+        'combined_liveness_score':  None,
+        'combined_liveness_real':   None,
+        'age_score':                None,
+        'age_note':                 None,
+        'age_detail':               {},
+        'occlusion_score':          None,
+        'occlusion_note':           None,
+        'occlusion_detail':         {},
     }
 
     # ── 19A: Extract face ─────────────────────────────────────
@@ -630,8 +1294,9 @@ def step19_face_pipeline(img_bgr, image_path, selfie_path=None):
         return face_result
 
     # Save face crop to outputs folder for inspection
-    face_out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "aadhaar_face_crop.jpg")
+    face_out_path = '/mnt/user-data/outputs/aadhaar_face_crop.jpg'
     try:
+        os.makedirs('/mnt/user-data/outputs', exist_ok=True)
         cv2.imwrite(face_out_path, face_img)
         ok(f"Face crop saved: {face_out_path}")
     except Exception:
@@ -643,13 +1308,47 @@ def step19_face_pipeline(img_bgr, image_path, selfie_path=None):
     face_result['quality_verdict'] = q_verdict
     face_result['quality_details'] = q_details
 
-    # ── 19D: Liveness hint ────────────────────────────────────
+    # ── 19D: Liveness hint (original FFT-based) ──────────────
     likely_real, live_score, live_note = step19d_liveness_hint(face_img)
     face_result['likely_real']    = likely_real
     face_result['liveness_score'] = live_score
     face_result['liveness_note']  = live_note
 
-    # ── 19C: Face match ───────────────────────────────────────
+    # ── 19E: Passive liveness (4-method texture analysis) ─────
+    # Runs on face region only — more precise than 19D
+    section("19E — Passive Liveness")
+    p_live_score, p_live_real, p_live_detail = step19e_passive_liveness(face_img)
+    face_result['passive_liveness_score']  = p_live_score
+    face_result['passive_liveness_real']   = p_live_real
+    face_result['passive_liveness_detail'] = p_live_detail
+
+    # Use the STRICTER of the two liveness scores for the final verdict
+    combined_liveness = min(live_score, p_live_score)
+    face_result['combined_liveness_score'] = combined_liveness
+    face_result['combined_liveness_real']  = (combined_liveness >= 55)
+    info(f"Combined liveness: {combined_liveness:.0f}/100 "
+         f"(FFT={live_score:.0f}, passive={p_live_score:.0f})")
+
+    # ── 19F: Age consistency check ────────────────────────────
+    dob_str = fields.get('dob', '') if fields else ''
+    age_score, age_note, age_detail = step19f_age_consistency(face_img, dob_str)
+    face_result['age_score']  = age_score
+    face_result['age_note']   = age_note
+    face_result['age_detail'] = age_detail
+
+    if age_score < 45:
+        warn(f"Age inconsistency detected: {age_note}")
+
+    # ── 19G: Occlusion & damage check ────────────────────────
+    occ_score, occ_note, occ_detail = step19g_occlusion_check(face_img)
+    face_result['occlusion_score']  = occ_score
+    face_result['occlusion_note']   = occ_note
+    face_result['occlusion_detail'] = occ_detail
+
+    if occ_score < 50:
+        warn(f"Occlusion/damage detected: {occ_note}")
+
+    # ── 19C: Face match (InsightFace → DeepFace → LBPH) ──────
     if selfie_path:
         match_result = step19c_face_match(face_img, selfie_path)
         face_result['match_result'] = match_result

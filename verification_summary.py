@@ -152,7 +152,7 @@ def _conclusion(ocr_val, qr_val, qr_match, mandatory=False):
 #  MINIMUM FIELD VERDICT ENGINE
 # ─────────────────────────────────────────────────────────────
 
-def _compute_final_verdict(fields, qr_result, verification, face_result=None):
+def _compute_final_verdict(fields, qr_result, verification, face_result=None, tamper_result=None, geo_result=None):
     """
     Compute the overall Aadhaar validity verdict.
 
@@ -210,6 +210,20 @@ def _compute_final_verdict(fields, qr_result, verification, face_result=None):
         liveness = face_result.get('liveness_score', 100)
         face_ok  = liveness >= 40  # must not be flagged as spoofed
 
+    # Tampering check
+    tamper_ok    = True
+    tamper_score = 100
+    if tamper_result:
+        tamper_ok    = tamper_result.get('passed', True)
+        tamper_score = tamper_result.get('score', 100)
+
+    # Geo-validation check
+    geo_ok    = True
+    geo_score = 100
+    if geo_result:
+        geo_ok    = geo_result.get('passed', True)
+        geo_score = geo_result.get('score', 100)
+
     # Determine verdict
     if mandatory_pass < 3:
         verdict      = "REJECTED ✗"
@@ -223,12 +237,28 @@ def _compute_final_verdict(fields, qr_result, verification, face_result=None):
         reason       = ("3/4 mandatory fields found. "
                         "One mandatory field missing — manual review needed.")
 
-    elif qr_trust >= 80 and qr_mismatches == 0 and face_ok:
+    elif not tamper_ok:
+        verdict      = "TAMPERED ✗"
+        verdict_color= "red"
+        reason       = (f"Anti-tampering check FAILED (score={tamper_score}/100). "
+                        f"Signals: "
+                        + "; ".join(tamper_result.get('signals', [])[:2]))
+
+    elif not geo_ok:
+        verdict      = "GEO INVALID ✗"
+        verdict_color= "red"
+        reason       = (f"Geographic impossibility detected (score={geo_score}/100). "
+                        + "; ".join(geo_result.get('signals', [])[:2]))
+
+    elif (qr_trust >= 80 and qr_mismatches == 0
+          and face_ok and tamper_ok and tamper_score >= 70
+          and geo_ok and geo_score >= 70):
         verdict      = "VERIFIED ✓"
         verdict_color= "green"
         reason       = (f"All 4 mandatory OCR fields valid. "
-                        f"QR trust score {qr_trust}/100 with "
-                        f"{qr_passes}/{qr_total_checked} field matches.")
+                        f"QR trust {qr_trust}/100. "
+                        f"Anti-tampering {tamper_score}/100. "
+                        f"Geo-validation {geo_score}/100.")
 
     elif qr_trust >= 60 or qr_passes >= 4:
         verdict      = "LIKELY GENUINE ✓"
@@ -271,7 +301,8 @@ def _compute_final_verdict(fields, qr_result, verification, face_result=None):
 # ─────────────────────────────────────────────────────────────
 
 def step17_summary(fields, verification, all_valid,
-                   qr_result=None, face_result=None):
+                   qr_result=None, face_result=None, tamper_result=None,
+                   geo_result=None):
     section("17 — Final Verification Report")
 
     qr_fields     = (qr_result or {}).get('qr_fields', {})
@@ -281,7 +312,7 @@ def step17_summary(fields, verification, all_valid,
     qr_format     = (qr_result or {}).get('qr_format', 'N/A')
 
     # ── Compute final verdict ─────────────────────────────────
-    final = _compute_final_verdict(fields, qr_result, verification, face_result)
+    final = _compute_final_verdict(fields, qr_result, verification, face_result, tamper_result, geo_result)
 
     # ── Column widths ─────────────────────────────────────────
     C0 = 22   # Field name
@@ -457,29 +488,80 @@ def step17_summary(fields, verification, all_valid,
     section_row('FACE AI')
 
     if face_result:
-        q_score   = face_result.get('quality_score', 0)
-        q_verdict = face_result.get('quality_verdict', '—')
-        live_score = face_result.get('liveness_score')
-        live_real  = face_result.get('likely_real')
-        match_res  = face_result.get('match_result')
+        q_score    = face_result.get('quality_score', 0)
+        q_verdict  = face_result.get('quality_verdict', '—')
 
+        # ── Face Quality ─────────────────────────────────────
         face_sym = "✓" if q_score >= 60 else "⚠"
         data_row("Face Quality",
                  f"{q_score}/100 ({q_verdict})", "N/A",
                  face_sym,
-                 "Good quality" if q_score >= 75 else "Acceptable" if q_score >= 45 else "Poor")
+                 "Good" if q_score >= 75 else "Acceptable" if q_score >= 45 else "Poor")
 
+        # ── FFT Liveness (19D) ────────────────────────────────
+        live_score = face_result.get('liveness_score')
+        live_real  = face_result.get('likely_real')
         if live_score is not None:
             live_sym = "✓" if live_real else "⚠"
-            data_row("Liveness",
+            data_row("Liveness (FFT 19D)",
                      f"{live_score:.0f}/100", "N/A",
                      live_sym,
-                     "Likely real" if live_real else "Suspicious — review")
+                     "Likely real" if live_real else "Suspicious")
 
+        # ── Passive Liveness (19E) ────────────────────────────
+        p_live = face_result.get('passive_liveness_score')
+        p_real = face_result.get('passive_liveness_real')
+        if p_live is not None:
+            p_sym = "✓" if p_real else "⚠"
+            data_row("Passive Liveness 19E",
+                     f"{p_live:.0f}/100", "N/A",
+                     p_sym,
+                     "Skin texture OK" if p_real else "Print/screen detected")
+
+        # ── Combined Liveness ─────────────────────────────────
+        c_live = face_result.get('combined_liveness_score')
+        c_real = face_result.get('combined_liveness_real')
+        if c_live is not None:
+            c_sym = "✓" if c_real else "✗"
+            data_row("Combined Liveness",
+                     f"{c_live:.0f}/100", "N/A",
+                     c_sym,
+                     "PASS" if c_real else "FAIL — possible spoof")
+
+        # ── Age Consistency (19F) ─────────────────────────────
+        age_score  = face_result.get('age_score')
+        age_note   = face_result.get('age_note', '—')
+        age_detail = face_result.get('age_detail', {})
+        if age_score is not None:
+            age_sym = "✓" if age_score >= 75 else ("⚠" if age_score >= 45 else "✗")
+            est_age = age_detail.get('estimated_age', '?')
+            dec_age = age_detail.get('declared_age', '?')
+            diff    = age_detail.get('age_diff', '?')
+            data_row("Age Consistency 19F",
+                     f"Est ~{est_age:.0f}yr / Decl {dec_age:.0f}yr",
+                     f"Diff: {diff:.0f}yr",
+                     age_sym,
+                     "Match" if age_score >= 75 else
+                     "Warning" if age_score >= 45 else "MISMATCH")
+
+        # ── Occlusion Check (19G) ─────────────────────────────
+        occ_score = face_result.get('occlusion_score')
+        occ_note  = face_result.get('occlusion_note', '—')
+        if occ_score is not None:
+            occ_sym = "✓" if occ_score >= 70 else ("⚠" if occ_score >= 45 else "✗")
+            data_row("Occlusion Check 19G",
+                     f"{occ_score}/100", "N/A",
+                     occ_sym,
+                     "Clear" if occ_score >= 70 else
+                     "Partial" if occ_score >= 45 else "Occluded/Damaged")
+
+        # ── Selfie Match (19C) ────────────────────────────────
+        match_res = face_result.get('match_result')
         if match_res:
-            ms = match_res.get('match_score', 0)
-            mv = match_res.get('verdict', '—')
-            data_row("Selfie Match",
+            ms     = match_res.get('match_score', 0)
+            mv     = match_res.get('verdict', '—')
+            engine = match_res.get('engine', '—')
+            data_row(f"Selfie Match ({engine[:10]})",
                      f"{ms:.0f}/100", "N/A",
                      "✓" if match_res.get('match') else "✗",
                      str(mv)[:C3 - 2])
@@ -487,6 +569,54 @@ def step17_summary(fields, verification, all_valid,
             data_row("Selfie Match", "No selfie provided", "N/A", "—", "Skipped")
     else:
         data_row("Face AI", "Not run", "N/A", "—", "Skipped")
+
+    # ═══════════════════════════════════════════════
+    #  SECTION: ANTI-TAMPERING
+    # ═══════════════════════════════════════════════
+    if tamper_result:
+        section_row('ANTI-TAMPERING — Step 20')
+        td = tamper_result.get('details', {})
+        detector_map = [
+            ('ela',      '20A ELA',             'Image re-compression check'),
+            ('noise',    '20B Noise Fingerprint','Clone-stamp detection'),
+            ('font',     '20C Font Consistency', 'Text overlay detection'),
+            ('moire',    '20D Moire Detection',  'Screen/photocopy check'),
+            ('hologram', '20E Hologram Check',   'UIDAI hologram presence'),
+            ('verhoeff', '20F Verhoeff Checksum','Mathematical validity'),
+        ]
+        for key, label, desc in detector_map:
+            d    = td.get(key, {})
+            sc   = d.get('score', 0)
+            note = d.get('note', '—')
+            sym  = "✓" if d.get('passed', True) else "✗"
+            bar  = "█" * int(sc / 10) + "░" * (10 - int(sc / 10))
+            ocr_col = f"{sc:>3}/100 [{bar}]"
+            data_row(label, ocr_col, _trunc(note, C2), sym,
+                     "Pass" if d.get('passed', True) else "FAIL")
+        separator_row()
+
+    # ═══════════════════════════════════════════════
+    #  SECTION: DATA INTELLIGENCE
+    # ═══════════════════════════════════════════════
+    if geo_result:
+        section_row('DATA INTELLIGENCE — Step 21')
+        gd = geo_result.get('details', {})
+        geo_detector_map = [
+            ('pin_geo',           '21A PIN Geo-Validation',    'PIN→State check'),
+            ('district_state',    '21B District-State Match',  'District→State check'),
+            ('ai_image',          '21C AI Image Detection',    'DCT analysis'),
+            ('name_plausibility', '21D Name Plausibility',     'Phoneme analysis'),
+        ]
+        for key, label, desc in geo_detector_map:
+            d    = gd.get(key, {})
+            sc   = d.get('score', 0)
+            note = d.get('note', '—')
+            sym  = "✓" if d.get('passed', True) else "✗"
+            bar  = "█" * int(sc / 10) + "░" * (10 - int(sc / 10))
+            ocr_col = f"{sc:>3}/100 [{bar}]"
+            data_row(label, ocr_col, _trunc(note, C2), sym,
+                     "Pass" if d.get('passed', True) else "FAIL")
+        separator_row()
 
     end_row()
 
@@ -528,6 +658,26 @@ def step17_summary(fields, verification, all_valid,
         print(f"  [RECOMMENDED]{lbl:<23}: {sym}")
     print(f"  Location fields matched: {loc_pass}/3 "
           f"({'OK' if loc_pass >= 2 else 'need 2+ for strong verification'})")
+
+    # ── Geo check in minimum field summary ──────────────────
+    if geo_result:
+        g_score   = geo_result.get('score', 100)
+        g_verdict = geo_result.get('verdict', '—')
+        g_sym     = "✓ VALID" if geo_result.get('passed', True) else "✗ INVALID"
+        print(f"  [GEO CHECK   ] {'Overall':<22}: {g_sym}  ({g_score}/100)")
+        for sig in geo_result.get('signals', []):
+            print(f"                 ✗  {sig[:68]}")
+        print()
+
+    # ── Tamper check in minimum field summary ───────────────
+    if tamper_result:
+        t_score   = tamper_result.get('score', 100)
+        t_verdict = tamper_result.get('verdict', '—')
+        t_sym     = "✓ CLEAN" if tamper_result.get('passed', True) else "✗ TAMPERED"
+        print(f"  [TAMPER CHECK] {'Overall':<22}: {t_sym}  ({t_score}/100)")
+        for sig in tamper_result.get('signals', []):
+            print(f"                 ✗  {sig[:68]}")
+        print()
 
     # ── FINAL VERDICT ─────────────────────────────────────────
     print()

@@ -52,23 +52,45 @@ def run_paddleocr(image_path_or_array):
         return "", False
 
     try:
+        import os as _os
+        import platform as _platform
+
+        # ── Windows OneDNN fix ────────────────────────────────
+        # PaddleOCR v3 uses OneDNN for CPU inference on Windows.
+        # The ConvertPirAttribute2RuntimeAttribute error is a known
+        # PaddlePaddle 3.x bug on Windows with certain CPU models.
+        # Fix: disable OneDNN so Paddle falls back to native CPU ops.
+        if _platform.system() == 'Windows':
+            _os.environ.setdefault('FLAGS_use_mkldnn', '0')
+            _os.environ.setdefault('FLAGS_enable_pir_api', '0')
+            _os.environ.setdefault('PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK', 'True')
+            info("Windows detected: OneDNN disabled for PaddleOCR stability")
+
         info("Initializing PaddleOCR (first run downloads models ~50MB)...")
 
-        # PaddleOCR v3+ changed its API significantly — catch ANY error
-        # and try progressively simpler init until one works.
+        # PaddleOCR v3+ changed its API significantly.
+        # We try 4 progressively simpler configs until one works.
+        # The Windows-safe config uses device='cpu' explicitly.
         ocr = None
 
-        for init_kwargs in [
-            {"use_textline_orientation": True, "lang": "en"},  # v3+ new API
-            {"use_angle_cls": True, "lang": "en"},             # v2.x with cls
-            {"lang": "en"},                                     # bare minimum
-        ]:
+        init_attempts = [
+            # v3+ new API with explicit CPU (safest on Windows)
+            {"use_textline_orientation": True, "lang": "en", "device": "cpu"},
+            # v3+ new API without device hint
+            {"use_textline_orientation": True, "lang": "en"},
+            # v2.x classic API with angle classifier
+            {"use_angle_cls": True, "lang": "en"},
+            # bare minimum — works on all versions
+            {"lang": "en"},
+        ]
+
+        for init_kwargs in init_attempts:
             try:
                 ocr = PaddleOCR(**init_kwargs)
                 ok(f"PaddleOCR initialized with: {list(init_kwargs.keys())}")
                 break
             except Exception as e:
-                warn(f"PaddleOCR init attempt {list(init_kwargs.keys())} failed: {e}")
+                warn(f"PaddleOCR init {list(init_kwargs.keys())} failed: {e}")
                 ocr = None
 
         if ocr is None:
@@ -78,6 +100,10 @@ def run_paddleocr(image_path_or_array):
         try:
             result = ocr.ocr(image_path_or_array, cls=True)
         except TypeError:
+            result = ocr.ocr(image_path_or_array)
+        except Exception as e:
+            # Windows OneDNN may still crash on first inference — retry without cls
+            warn(f"PaddleOCR inference with cls failed: {e}, retrying without cls")
             result = ocr.ocr(image_path_or_array)
 
         if not result or result == [None]:
@@ -145,6 +171,122 @@ def run_tesseract_passes(binary, original_color):
                      "--oem 3 --psm 11 -l eng"))
     return texts
 
+
+
+def run_trocr(image_input):
+    """
+    Engine 3 — TrOCR (Transformer OCR by Microsoft)
+
+    WHY TrOCR IS BETTER THAN PADDLEOCR ON BLURRY IMAGES:
+      PaddleOCR uses CRNN (CNN + RNN) for recognition.
+      TrOCR uses a Vision Transformer encoder + language model
+      decoder. This means it has prior knowledge of how real
+      words/numbers SHOULD look — so even when pixels are
+      merged by blur, it can infer the correct characters.
+
+      On severely blurry images (Laplacian score < 30):
+        PaddleOCR : often reads "D0B: 10/1?/200?" — gives up
+        TrOCR     : reads "DOB: 10/11/2005" — infers from context
+
+      This is because the decoder is a language model that
+      has seen millions of document images during training.
+
+    MODEL:
+      microsoft/trocr-base-printed  — best for printed ID cards
+      microsoft/trocr-large-printed — more accurate, slower
+
+    INSTALL:
+      pip install transformers torch pillow
+
+    STRATEGY:
+      TrOCR works on image patches, not full images.
+      We crop the image into horizontal bands (each field)
+      and run TrOCR on each band independently.
+      This matches how the model was trained.
+
+    RETURNS: (text: str, available: bool)
+    """
+    try:
+        from transformers import TrOCRProcessor, VisionEncoderDecoderModel
+        from PIL import Image as PILImage
+        import torch
+    except ImportError:
+        return "", False
+
+    try:
+        info("Initializing TrOCR (microsoft/trocr-base-printed)...")
+        info("First run downloads ~400MB model — cached after that")
+
+        processor = TrOCRProcessor.from_pretrained(
+            "microsoft/trocr-base-printed",
+            use_fast=True
+        )
+        model = VisionEncoderDecoderModel.from_pretrained(
+            "microsoft/trocr-base-printed"
+        )
+        device = "cuda" if __import__("torch").cuda.is_available() else "cpu"
+        model.to(device)
+        model.eval()
+        ok(f"TrOCR loaded on {device}")
+
+        # Convert input to PIL image
+        if isinstance(image_input, str):
+            pil_img = PILImage.open(image_input).convert("RGB")
+        else:
+            import numpy as np
+            if len(image_input.shape) == 2:
+                # Grayscale → RGB
+                pil_img = PILImage.fromarray(
+                    cv2.cvtColor(image_input, cv2.COLOR_GRAY2RGB)
+                )
+            else:
+                pil_img = PILImage.fromarray(
+                    cv2.cvtColor(image_input, cv2.COLOR_BGR2RGB)
+                )
+
+        h, w = pil_img.size[1], pil_img.size[0]
+
+        # ── Crop into horizontal bands and OCR each ────────
+        # Aadhaar card text is in rows — TrOCR reads one line at a time
+        # We use 8 equal horizontal slices to cover all text rows
+        num_bands = 8
+        band_h    = h // num_bands
+        all_lines = []
+
+        import torch
+        with torch.no_grad():
+            for i in range(num_bands):
+                y1 = i * band_h
+                y2 = min((i + 1) * band_h, h)
+                band = pil_img.crop((0, y1, w, y2))
+
+                # Skip nearly-white bands (no text)
+                import numpy as np
+                band_arr = np.array(band)
+                if np.mean(band_arr) > 245:
+                    continue
+
+                pixel_values = processor(
+                    images=band,
+                    return_tensors="pt"
+                ).pixel_values.to(device)
+
+                generated_ids = model.generate(pixel_values)
+                text = processor.batch_decode(
+                    generated_ids,
+                    skip_special_tokens=True
+                )[0].strip()
+
+                if text:
+                    all_lines.append(text)
+
+        combined = "\n".join(all_lines)
+        ok(f"TrOCR extracted {len(combined)} chars from {len(all_lines)} bands")
+        return combined, True
+
+    except Exception as e:
+        warn(f"TrOCR failed: {e}")
+        return "", False
 
 
 def step13_tesseract(binary, original_color, image_path=None):
@@ -221,9 +363,9 @@ def step13_tesseract(binary, original_color, image_path=None):
         warn("Triggering Engine 3: TrOCR (Transformer OCR) for blur recovery")
         print()
         trocr_input = image_path if image_path else original_color
-        trocr_text, trocr_conf, trocr_available = run_trocr(trocr_input, confidence_threshold=0.5)
+        trocr_text, trocr_available = run_trocr(trocr_input)
         if trocr_available and trocr_text.strip():
-            ok(f"TrOCR recovered {len(trocr_text)} additional chars (conf={trocr_conf:.3f})")
+            ok(f"TrOCR recovered {len(trocr_text)} additional chars")
             all_texts.append(trocr_text)
         elif trocr_available:
             warn("TrOCR also returned empty — image may be too degraded")
@@ -313,15 +455,34 @@ def run_trocr(image_input, confidence_threshold=0.5):
         info("Loading TrOCR model (microsoft/trocr-large-printed)...")
         info("First run downloads ~1.3 GB — subsequent runs use cache")
 
-        processor = TrOCRProcessor.from_pretrained(
-            "microsoft/trocr-large-printed"
-        )
-        model = VisionEncoderDecoderModel.from_pretrained(
-            "microsoft/trocr-large-printed"
-        )
+        # ── TrOCR model loading (meta-device safe) ───────────
+        # Error: "Tensor on device meta is not on the expected device cpu"
+        # Cause: from_pretrained with device_map='auto' puts some weights
+        #        on 'meta' (placeholder) device and .to(device) fails.
+        # Fix 1: Never use device_map='auto' for TrOCR.
+        # Fix 2: Call tie_weights() after loading to link encoder/decoder.
+        # Fix 3: Use low_cpu_mem_usage=False to force eager loading.
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        model.to(device)
+        info(f"Loading TrOCR on device: {device}")
+
+        processor = TrOCRProcessor.from_pretrained(
+            "microsoft/trocr-large-printed",
+            use_fast=True,
+        )
+        model = VisionEncoderDecoderModel.from_pretrained(
+            "microsoft/trocr-large-printed",
+            device_map=None,           # NEVER use 'auto' — causes meta-device error
+            low_cpu_mem_usage=False,   # force all weights loaded eagerly
+        )
+
+        # tie_weights() syncs encoder/decoder token embeddings.
+        # Without it, missing weights trigger the meta-device error.
+        if hasattr(model, 'tie_weights'):
+            model.tie_weights()
+
+        model = model.to(device)
+        model.eval()
         ok(f"TrOCR loaded on {device}")
 
         # Convert input to PIL RGB

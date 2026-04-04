@@ -1,5 +1,5 @@
 # ============================================================
-#  Aadhaar OCR v5 — Requirements
+#  AadhaarCheck v5 — Requirements
 #  Install: pip install -r requirements.txt
 #
 #  SYSTEM DEPENDENCIES (install separately):
@@ -19,41 +19,77 @@ opencv-python
 numpy
 Pillow
 pytesseract
+python-dotenv
 
 
 # ── LLM CORRECTION (Groq API) ────────────────────────────────
 
 openai
-# Usage: export GROQ_API_KEY=gsk_...
 # Free key at: https://console.groq.com
+# Add to .env: GROQ_API_KEY=gsk_...
 
 
 # ── QR CODE DETECTION ────────────────────────────────────────
 
 pyzbar
 # Ubuntu: sudo apt install libzbar0
-# Falls back to OpenCV QRCodeDetector if not installed
 
 
-# ── FACE AI — DEEP LEARNING MATCH ────────────────────────────
+# ── FACE AI ──────────────────────────────────────────────────
 
 deepface
 tensorflow
-# Downloads ~500MB VGG-Face model on first run (cached)
-# Falls back to OpenCV LBPH if not installed
+# Phase 3: age estimation, face matching (VGG-Face)
+# Downloads ~500MB VGG-Face model on first run
+
+insightface
+onnxruntime
+# Phase 3 upgrade: ArcFace matching (99.83% accuracy)
+# pip install insightface onnxruntime
+# Downloads buffalo_sc model (~200MB) on first run
 
 
 # ── OCR ENGINE 2 — PaddleOCR ─────────────────────────────────
 
 paddlepaddle
 paddleocr
+# Phase 1 fix: Windows users set these env vars in .env:
+#   FLAGS_use_mkldnn=0
+#   FLAGS_enable_pir_api=0
+#   PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True
 
 
-# ── OCR ENGINE 3 — TrOCR + Local LLM Fallback ────────────────
+# ── OCR ENGINE 3 — TrOCR ─────────────────────────────────────
 
 transformers
 torch
 sentencepiece
+# Phase 1 fix: always use device_map=None when loading
+
+
+# ── CARBON TRACKING ──────────────────────────────────────────
+
+codecarbon
+
+
+# ── PHASE 5 — PDF REPORTS ────────────────────────────────────
+
+reportlab
+# Generates signed PDF verification reports
+
+
+# ── PHASE 5 — DUPLICATE DETECTION ────────────────────────────
+
+imagehash
+# Perceptual hashing for duplicate card detection
+# pip install imagehash
+
+
+# ── PHASE 5/6 — SERVER ───────────────────────────────────────
+
+flask
+flask-cors
+# Production server with API key auth, rate limiting, auto-delete
 
 
 # ── SUPER RESOLUTION (optional) ──────────────────────────────

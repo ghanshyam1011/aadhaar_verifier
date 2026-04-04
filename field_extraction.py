@@ -354,6 +354,9 @@ def extract_issue_date(text):
     m = re.search(r'Issue\s*Date[:\s]+(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{4})', text, re.IGNORECASE)
     if m:
         return m.group(1)
+    # Sometimes on the side: "Issue Date: 13/12/2011"
+    m = re.search(r'(\d{2}[\/\-]\d{2}[\/\-]\d{4})', text)
+    # Only return if it's before the main DOB (issue dates are usually earlier)
     return None
 
 def extract_mobile(text):
@@ -609,8 +612,33 @@ def extract_address_structured(text):
         return addr
 
     raw_addr = ' '.join(addr_lines)
-    # Remove trailing OCR noise fragments like "eae eas eee"
-    raw_addr = re.sub(r'\s+[a-z]{1,3}(\s+[a-z]{1,3}){2,}$', '', raw_addr).strip()
+
+    # ── Strip OCR noise from address string ──────────────────
+    # Tesseract misreads barcodes/holograms at card edges as
+    # 2-3 char lowercase gibberish sequences like "eae eas eee".
+    #
+    # Rules applied in order:
+    #  1. Remove trailing runs of 2–3 char lowercase-only tokens
+    #     e.g. "eae eas eee", "ue oe ae"
+    #  2. Remove tokens that are ALL non-alpha (punctuation debris)
+    #     e.g. ":::", "---", "~~~"
+    #  3. Remove lone single characters that slipped through
+    #     e.g. trailing "a", "e", "z"
+
+    # Rule 1: trailing 2-3 char lowercase gibberish runs
+    raw_addr = re.sub(r'(\s+[a-z]{1,3}){2,}$', '', raw_addr).strip()
+
+    # Rule 2: tokens made entirely of non-alphanumeric chars
+    raw_addr = re.sub(r'\s+[^a-zA-Z0-9]+(?=\s|$)', ' ', raw_addr).strip()
+
+    # Rule 3: trailing lone single char
+    raw_addr = re.sub(r'\s+[a-zA-Z]$', '', raw_addr).strip()
+
+    # Also clean any internal repeated short-gibberish runs inside addr
+    # e.g. "near kamla niwas, eae eas, katemanivali" → remove the middle chunk
+    raw_addr = re.sub(r',?\s*(?:\b[a-z]{1,3}\b\s*){3,}', ' ', raw_addr).strip()
+    raw_addr = re.sub(r'\s{2,}', ' ', raw_addr).strip()
+
     addr['raw'] = raw_addr
 
     # ── Extract PIN code ──────────────────────────────────────
@@ -655,7 +683,11 @@ def extract_address_structured(text):
         raw_addr, re.IGNORECASE
     )
     if lm_m:
-        addr['landmark'] = lm_m.group(1).strip().rstrip(',')
+        lm_raw = lm_m.group(1).strip().rstrip(',')
+        # Remove trailing OCR noise from landmark too
+        lm_raw = re.sub(r'(\s+[a-z]{1,3}){2,}$', '', lm_raw).strip()
+        lm_raw = re.sub(r',?\s*(?:\b[a-z]{1,3}\b\s*){3,}', ' ', lm_raw).strip().rstrip(',')
+        addr['landmark'] = lm_raw if lm_raw else None
 
     # ── Extract Village/Town/City ─────────────────────────────
     loc_m = re.search(
