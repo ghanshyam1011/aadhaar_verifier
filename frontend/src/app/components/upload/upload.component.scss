@@ -1,0 +1,255 @@
+.upload-page {
+  max-width: 900px;
+  margin: 0 auto;
+}
+
+.upload-form {
+  &.hidden { display: none; }
+}
+
+/* ── Hero ─────────────────────────────────────────────────── */
+.hero {
+  margin-bottom: 40px;
+}
+
+.hero-eyebrow {
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--accent-light);
+  font-family: var(--font-mono);
+  margin-bottom: 10px;
+}
+
+h1 {
+  font-size: 3rem;
+  font-weight: 800;
+  letter-spacing: -0.04em;
+  line-height: 1.05;
+  margin-bottom: 16px;
+
+  .serif {
+    color: var(--text-secondary);
+    font-weight: 400;
+  }
+}
+
+.hero-desc {
+  font-size: 0.95rem;
+  color: var(--text-secondary);
+  max-width: 520px;
+  line-height: 1.7;
+}
+
+/* ── Upload Grid ─────────────────────────────────────────── */
+.upload-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  margin-bottom: 16px;
+
+  @media (max-width: 640px) {
+    grid-template-columns: 1fr;
+  }
+}
+
+.slot {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.slot-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.slot-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 0.72rem;
+  color: var(--text-tertiary);
+  padding: 0 2px;
+
+  span:first-child {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 200px;
+    font-family: var(--font-mono);
+  }
+}
+
+/* ── Drop zone specifics ─────────────────────────────────── */
+.drop-zone {
+  min-height: 160px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+}
+
+.drop-hint {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  pointer-events: none;
+}
+
+.drop-icon {
+  font-size: 2rem;
+  margin-bottom: 6px;
+  filter: grayscale(0.3);
+}
+
+.drop-label {
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+
+.drop-sub {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+}
+
+.drop-preview {
+  width: calc(100% - 16px);
+  max-height: 130px;
+  object-fit: cover;
+  border-radius: var(--r-sm);
+  display: block;
+}
+
+.remove-btn {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  background: rgba(0,0,0,0.6);
+  color: var(--text-primary);
+  border: none;
+  border-radius: 50%;
+  width: 22px;
+  height: 22px;
+  font-size: 0.65rem;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10;
+  transition: background var(--t-fast);
+
+  &:hover { background: rgba(248,81,73,0.8); }
+}
+
+/* ── Selfie Row ──────────────────────────────────────────── */
+.selfie-row {
+  display: grid;
+  grid-template-columns: 260px 1fr;
+  gap: 20px;
+  margin-bottom: 24px;
+  align-items: start;
+
+  @media (max-width: 640px) {
+    grid-template-columns: 1fr;
+  }
+}
+
+.selfie-slot .drop-zone {
+  min-height: 130px;
+}
+
+.selfie-info {
+  padding: 20px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-dim);
+  border-radius: var(--r-lg);
+
+  h3 {
+    font-size: 0.85rem;
+    font-weight: 600;
+    margin-bottom: 12px;
+    color: var(--text-secondary);
+  }
+
+  ul {
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-bottom: 14px;
+
+    li {
+      font-size: 0.8rem;
+      color: var(--text-secondary);
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      line-height: 1.4;
+    }
+  }
+}
+
+.check-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--green);
+  flex-shrink: 0;
+  margin-top: 5px;
+}
+
+.info-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.chip {
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  padding: 2px 8px;
+  border: 1px solid var(--border-mid);
+  border-radius: 20px;
+  color: var(--text-tertiary);
+  background: var(--bg-elevated);
+}
+
+/* ── Error banner ────────────────────────────────────────── */
+.error-banner {
+  background: var(--red-dim);
+  border: 1px solid var(--red-border);
+  border-radius: var(--r-md);
+  padding: 12px 16px;
+  font-size: 0.85rem;
+  color: var(--red);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.error-icon { font-size: 1rem; }
+
+/* ── Submit Row ──────────────────────────────────────────── */
+.submit-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.submit-btn {
+  padding: 13px 28px;
+  font-size: 0.95rem;
+  border-radius: var(--r-lg);
+  gap: 10px;
+}
+
+.submit-note {
+  font-size: 0.75rem;
+}

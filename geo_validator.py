@@ -419,9 +419,12 @@ INDIAN_NAME_PATTERNS = {
 # ── AI image detection DCT thresholds ────────────────────────
 # Empirically determined from analysis of genuine vs AI-generated cards
 AI_IMAGE_DCT_THRESHOLDS = {
-    'block_variance_cv':   0.35,   # genuine: cv > 0.35 (varied blocks)
-    'high_freq_uniformity': 0.15,  # genuine: < 0.15 (natural falloff)
-    'zero_count_ratio':    0.25,   # genuine: few exact zeros in DCT
+    # Raised thresholds: real card photos on flat surfaces have naturally
+    # low block variance (large uniform background areas). We now require
+    # ALL 3 indicators to fire before flagging as AI-generated.
+    'block_variance_cv':    0.20,   # genuine: cv > 0.20 (was 0.35 — too strict)
+    'high_freq_uniformity': 0.18,   # genuine: < 0.18 (slight raise)
+    'zero_count_ratio':     0.30,   # genuine: < 0.30 (slight raise)
 }
 
 
@@ -647,14 +650,21 @@ def _detect_ai_image(img_bgr):
 
     n_flags = len(flags)
 
-    if n_flags >= 2:
-        score  = 20
-        note   = (f"AI-generated image likely ({n_flags}/3 indicators): "
+    # Require ALL 3 indicators to fire to flag as AI-generated.
+    # A real card photograph can easily trigger 1-2 indicators due to
+    # uniform background areas and JPEG compression characteristics.
+    if n_flags == 3:
+        score  = 15
+        note   = (f"AI-generated image likely (3/3 indicators): "
                   + "; ".join(flags[:2]))
         passed = False
+    elif n_flags == 2:
+        score  = 55
+        note   = (f"Mild AI indicators ({n_flags}/3): {flags[0][:50]} — "                  f"likely a real card photo on uniform background")
+        passed = True   # 2/3 is NOT enough to fail — just warn
     elif n_flags == 1:
-        score  = 60
-        note   = f"Mild AI artifact ({flags[0][:60]}) — verify manually"
+        score  = 75
+        note   = f"One weak AI indicator — almost certainly a real card photo"
         passed = True
     else:
         score  = 90

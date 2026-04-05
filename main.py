@@ -46,6 +46,7 @@ from face_ai import step19_face_pipeline
 from qr_verification import step18_qr_verify
 
 from tampering import step20_tampering_analysis
+
 from geo_validator import step21_geo_validate
 
 from verification_summary import (
@@ -145,13 +146,49 @@ def open_file_dialog():
         ok(f"Image accepted: {path}")
         return path
 
-def run_pipeline(front_path, back_path=None, selfie_path=None):
 
+def _backfill_fields_from_qr(fields, qr_result):
+    """Fill missing OCR fields from decoded QR data without overwriting OCR values."""
+    merged_fields = dict(fields or {})
+    qr_fields = (qr_result or {}).get("qr_fields") or {}
+
+    field_map = {
+        "name": "name",
+        "dob": "dob",
+        "gender": "gender",
+        "aadhaar_number": "aadhaar_number",
+        "address_pin": "pin",
+        "address_district": ("district", "district2"),
+        "address_state": "state",
+    }
+
+    def _is_missing(value):
+        return value is None or str(value).strip() in {"", "None", "—"}
+
+    for target_key, source_keys in field_map.items():
+        if not _is_missing(merged_fields.get(target_key)):
+            continue
+
+        if isinstance(source_keys, str):
+            source_keys = (source_keys,)
+
+        for source_key in source_keys:
+            source_value = qr_fields.get(source_key)
+            if not _is_missing(source_value):
+                merged_fields[target_key] = source_value
+                break
+
+    return merged_fields
+
+def run_pipeline(front_path, back_path=None, selfie_path=None):
+    """
+    Full pipeline — identical to main() but called by server.py.
+    Processes front + back, runs TrOCR, LLM, face AI, QR, tampering, geo.
+    """
     tracker = EmissionsTracker()
     tracker.start()
 
-    DOC_TYPE = "aadhaar"
-
+    # ── FRONT SIDE ────────────────────────────────────────────
     front_orig  = step1_load(front_path)
     front_res   = step2_resize(front_orig)
     front_sr    = step2b_super_resolution(front_res)
@@ -162,50 +199,118 @@ def run_pipeline(front_path, back_path=None, selfie_path=None):
     front_den   = step7_denoise(front_gray)
     front_enh   = step8_clahe(front_den)
     front_sh    = step9_adaptive_sharpen(front_enh)
-
     f_otsu, f_adap, f_blend = step10_binarize(front_sh)
     front_desk  = step11_deskew(f_blend)
     front_clean = step12_morph(front_desk)
-
     front_text, front_passes = step13_tesseract(front_clean, front_ori, front_path)
 
-    combined_text = front_text
-    all_pass_texts = front_passes
+    # ── BACK SIDE (if provided) ───────────────────────────────
+    back_text   = ""
+    back_passes = []
+    back_orig   = None
 
+    if back_path:
+        back_orig   = step1_load(back_path)
+        back_res    = step2_resize(back_orig)
+        back_sr     = step2b_super_resolution(back_res)
+        back_ori    = step3_orient(back_sr)
+        back_nc     = step5_remove_color_noise(back_ori)
+        back_gray   = step6_grayscale(back_nc)
+        back_den    = step7_denoise(back_gray)
+        back_enh    = step8_clahe(back_den)
+        back_sh     = step9_adaptive_sharpen(back_enh)
+        b_otsu, b_adap, b_blend = step10_binarize(back_sh)
+        back_desk   = step11_deskew(b_blend)
+        back_clean  = step12_morph(back_desk)
+        back_text, back_passes = step13_tesseract(back_clean, back_ori, back_path)
+
+    # ── MERGE front + back OCR ────────────────────────────────
+    combined_text  = front_text + ("\n" + back_text if back_text else "")
+    all_pass_texts = front_passes + back_passes
+    ok(f"Total OCR text: {len(combined_text)} chars "
+       f"(front={len(front_text)}, back={len(back_text)})")
+
+    # ── FIELD EXTRACTION + OCR CORRECTION ────────────────────
     fields = step14_extract(combined_text)
     fields = step14b_correct(fields, all_pass_texts)
 
+    # ── TrOCR ────────────────────────────────────────────────
+    info("Running TrOCR for additional OCR diversity...")
+    trocr_text, trocr_conf, trocr_ok = run_trocr(front_path,
+                                                   confidence_threshold=0.5)
+    if trocr_ok and trocr_text.strip():
+        combined_text  = combined_text + "\n" + trocr_text
+        all_pass_texts = all_pass_texts + [trocr_text]
+        ok(f"TrOCR added {len(trocr_text)} chars (conf={trocr_conf:.3f})")
+    elif not trocr_ok:
+        info("TrOCR not available — install: pip install transformers torch")
+
+    # ── LLM CORRECTION ────────────────────────────────────────
+    fields = step14c_llm_correct(fields, raw_ocr_text=combined_text)
+
+    # ── VERIFICATION ──────────────────────────────────────────
     verification, all_valid = step15_verify(fields)
 
-    face_result = step19_face_pipeline(front_orig, front_path,
-                                       selfie_path=selfie_path,
-                                       fields=fields)
-
-    qr_result = step18_qr_verify(front_path, fields)
-
-    # Back-fill OCR-missed fields from QR
-    fields = _backfill_fields_from_qr(fields, qr_result)
-
-    # Step 20 — Anti-tampering
-    tamper_result = step20_tampering_analysis(
-        front_orig, None, fields,
-        card_type=fields.get('card_type')
+    # ── FACE AI ───────────────────────────────────────────────
+    face_result = step19_face_pipeline(
+        front_orig, front_path,
+        selfie_path=selfie_path,
+        fields=fields,
     )
 
-    # Step 21 — Data intelligence validation
+    # ── QR VERIFICATION (prefer back side — has the large QR) ─
+    qr_source = back_path if back_path else front_path
+    qr_result = step18_qr_verify(qr_source, fields)
+
+    # ── QR BACK-FILL ──────────────────────────────────────────
+    fields = _backfill_fields_from_qr(fields, qr_result)
+
+    # ── TAMPERING ANALYSIS ────────────────────────────────────
+    tamper_result = step20_tampering_analysis(
+        front_orig,
+        back_orig if back_path else None,
+        fields,
+        card_type=fields.get('card_type'),
+    )
+
+    # ── GEO / DATA INTELLIGENCE ──────────────────────────────
     geo_result = step21_geo_validate(fields, img_bgr=front_orig)
 
-    all_fraud = (qr_result.get("fraud_signals", []) +
-                 tamper_result.get("signals", []) +
-                 geo_result.get("signals", []))
+    # ── FINAL VERDICT ─────────────────────────────────────────
+    all_fraud = (
+        qr_result.get("fraud_signals", []) +
+        tamper_result.get("signals", []) +
+        geo_result.get("signals", [])
+    )
+
+    qr_trust   = qr_result.get("trust_score", 0)
+    tamper_ok  = tamper_result.get("passed", True)
+    geo_ok     = geo_result.get("passed", True)
+
+    if all_valid and tamper_ok and geo_ok and qr_trust >= 80:
+        verdict_label = "VERIFIED"
+        verdict_color = "green"
+        verdict_score = 95
+    elif all_valid and tamper_ok and geo_ok:
+        verdict_label = "VALID"
+        verdict_color = "green"
+        verdict_score = 80
+    elif all_valid:
+        verdict_label = "REVIEW REQUIRED"
+        verdict_color = "yellow"
+        verdict_score = 60
+    else:
+        verdict_label = "REVIEW REQUIRED"
+        verdict_color = "yellow"
+        verdict_score = 40
 
     result = {
-        "fields": fields,
+        "fields":  fields,
         "verdict": {
-            "label":  "VALID" if all_valid and tamper_result['passed'] else "REVIEW REQUIRED",
+            "label":  verdict_label,
             "detail": "Verification completed",
-            "score":  80 if all_valid else 40,
-            "color":  "green" if all_valid and tamper_result['passed'] else "yellow",
+            "score":  verdict_score,
+            "color":  verdict_color,
             "passed": [],
             "issues": all_fraud,
         },
@@ -214,52 +319,13 @@ def run_pipeline(front_path, back_path=None, selfie_path=None):
         "tamper": tamper_result,
         "geo":    geo_result,
     }
-    emissions = tracker.stop()
 
-    print("\n🌱 Carbon Emission Report")
-    print(f"Estimated CO₂ emissions: {emissions:.6f} kg")
+    emissions = tracker.stop()
+    print("\n\U0001f331 Carbon Emission Report")
+    print(f"Estimated CO\u2082 emissions: {emissions:.6f} kg")
 
     return result
 
-def _backfill_fields_from_qr(fields, qr_result):
-    """
-    Back-fill missing OCR fields from QR code data.
-    
-    Only fills fields that are empty/None in the OCR results.
-    """
-    qr_fields = qr_result.get('qr_fields', {})
-    
-    # Mapping from QR field names to fields dict keys
-    mapping = {
-        'name': 'name',
-        'dob': 'dob', 
-        'gender': 'gender',
-        'pin': 'address_pin',
-        'district': 'address_district',
-        'state': 'address_state',
-        'building': 'address_house',
-        'street': 'address_street',
-        'landmark': 'address_landmark',
-        'locality': 'address_locality',
-        'vtc': 'address_subdistrict',
-        'subdistrict': 'address_subdistrict',
-        'mobile_masked': 'mobile',
-        'reference_id': 'reference_id',
-    }
-    
-    for qr_key, field_key in mapping.items():
-        qr_value = qr_fields.get(qr_key)
-        if qr_value and not fields.get(field_key):
-            fields[field_key] = qr_value
-            info(f"  Back-filled {field_key} from QR: {qr_value}")
-    
-    # Special handling for mobile_last4 - append to mobile if available
-    mobile_last4 = qr_fields.get('mobile_last4')
-    if mobile_last4 and fields.get('mobile') and len(fields['mobile']) <= 4:
-        # If mobile is just the last 4 digits, keep the masked version
-        fields['mobile'] = qr_fields.get('mobile_masked', fields['mobile'])
-    
-    return fields
 
 def main():
     tracker = EmissionsTracker()
@@ -397,35 +463,16 @@ def main():
 
     # ── Face AI — run on front side (has the photo) ───────────
     face_result = step19_face_pipeline(front_orig, front_path,
-                                       selfie_path=selfie_path,
-                                       fields=fields)
+                                       selfie_path=selfie_path)
 
     # ── QR Cross-Verification — prefer back side QR ──────────
     # Back side has the large QR code; front has a smaller one
     qr_source = back_path if back_path else front_path
     qr_result = step18_qr_verify(qr_source, fields)
 
-    # ── Back-fill OCR-missed fields from QR ───────────────────
-    fields = _backfill_fields_from_qr(fields, qr_result)
-
-    # ── Step 20 — Anti-tampering analysis ─────────────────────
-    tamper_result = step20_tampering_analysis(
-        front_orig,
-        back_orig if back_path else None,
-        fields,
-        card_type=fields.get('card_type')
-    )
-
-    # ── Step 21 — Data intelligence validation ───────────────
-    geo_result = step21_geo_validate(
-        fields, img_bgr=front_orig
-    )
-
     # ── Final Summary ─────────────────────────────────────────
     step17_summary(fields, verification, all_valid,
-                   qr_result=qr_result, face_result=face_result,
-                   tamper_result=tamper_result,
-                   geo_result=geo_result)
+                   qr_result=qr_result, face_result=face_result)
     emissions = tracker.stop()
 
     print("\n🌱 Carbon Emission Report")

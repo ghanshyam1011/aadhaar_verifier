@@ -5,7 +5,7 @@
 # DETECTORS:
 #   20A — Error Level Analysis (ELA)
 #          Detects JPEG re-compression in locally edited regions.
-#          A spliced name or number shows as a bright patch.
+#          A spliced name or numbercd ..\..\Downloads\aadhaar-angular-app\aadhaar-app shows as a bright patch.
 #
 #   20B — Noise Fingerprint Analysis
 #          Camera sensor noise is spatially uniform on a genuine card.

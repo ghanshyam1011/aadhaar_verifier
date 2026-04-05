@@ -23,6 +23,25 @@ from flask_cors import CORS
 
 from main import run_pipeline
 
+# ── Make sure THIS file's folder is always on sys.path ───────
+# Fixes "No module named 'report_generator'" when Flask is
+# launched from a different working directory (common on Windows).
+import sys as _sys, os as _os
+_HERE = _os.path.dirname(_os.path.abspath(__file__))
+if _HERE not in _sys.path:
+    _sys.path.insert(0, _HERE)
+
+# Pre-import report_generator so errors surface immediately at startup
+# rather than silently during the first request.
+try:
+    from report_generator import generate_pdf_report as _gen_pdf
+    _PDF_AVAILABLE = True
+except ImportError as _e:
+    print(f"  [!!]  report_generator not available: {_e}")
+    print(f"        Make sure report_generator.py is in: {_HERE}")
+    _gen_pdf = None
+    _PDF_AVAILABLE = False
+
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -62,14 +81,62 @@ def _cleanup(temp_dir):
         pass
 
 
-def _convert(obj):
-    if isinstance(obj, set):           return list(obj)
-    if isinstance(obj, dict):          return {k: _convert(v) for k, v in obj.items()}
-    if isinstance(obj, list):          return [_convert(i) for i in obj]
-    if isinstance(obj, np.integer):    return int(obj)
-    if isinstance(obj, np.floating):   return float(obj)
-    if isinstance(obj, np.ndarray):    return obj.tolist()
+def _to_python(obj):
+    """
+    Recursively convert any object to a JSON-safe Python primitive.
+    Handles ALL numpy scalar types using numpy's own dtype checking,
+    which works across numpy 1.x and 2.x on all platforms.
+    """
+    # None → null
+    if obj is None:
+        return None
+
+    # numpy array → list (recurse each element)
+    if isinstance(obj, np.ndarray):
+        return [_to_python(x) for x in obj.tolist()]
+
+    # numpy scalar — use numpy's own item() to convert to Python native
+    # This handles np.bool_, np.int8/16/32/64, np.uint*, np.float16/32/64
+    # np.complex*, np.str_, np.bytes_ — everything numpy defines
+    if isinstance(obj, np.generic):
+        py = obj.item()           # always returns a Python native type
+        if isinstance(py, bool):  return bool(py)
+        if isinstance(py, int):   return int(py)
+        if isinstance(py, float): return float(py)
+        return py                 # str, bytes, complex etc.
+
+    # Python bool BEFORE int (bool is subclass of int in Python)
+    if isinstance(obj, bool):
+        return bool(obj)
+
+    # Python set → list
+    if isinstance(obj, set):
+        return [_to_python(x) for x in obj]
+
+    # dict — recurse keys and values
+    if isinstance(obj, dict):
+        return {str(k): _to_python(v) for k, v in obj.items()}
+
+    # list / tuple — recurse
+    if isinstance(obj, (list, tuple)):
+        return [_to_python(x) for x in obj]
+
+    # Python int / float — cast to make sure no subclasses sneak through
+    if isinstance(obj, int):   return int(obj)
+    if isinstance(obj, float): return float(obj)
+
+    # bytes → base64 string (safe for JSON)
+    if isinstance(obj, bytes):
+        import base64
+        return base64.b64encode(obj).decode('ascii')
+
+    # Everything else: str, bool already handled above, pass through
     return obj
+
+
+def _convert(obj):
+    """Public alias used throughout the server."""
+    return _to_python(obj)
 
 
 def _rate_ok(key):
@@ -281,7 +348,9 @@ def validate():
         # PDF report
         report_id = report_hash = None
         try:
-            from report_generator import generate_pdf_report
+            if not _PDF_AVAILABLE:
+                raise ImportError("report_generator.py not found — skipping PDF")
+            generate_pdf_report = _gen_pdf
             fields        = result.get('fields', {})
             verdict_str   = result.get('verdict', {}).get('label', 'REVIEW REQUIRED')
             verification  = {}

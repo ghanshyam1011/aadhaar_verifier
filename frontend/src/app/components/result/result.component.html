@@ -1,0 +1,242 @@
+<div class="result-page fade-up">
+
+  <!-- ══════════════════════════════════════════════════════
+       VERDICT BANNER
+  ══════════════════════════════════════════════════════ -->
+  <div class="verdict-banner" [ngClass]="verdictClass">
+    <div class="verdict-left">
+      <div class="verdict-icon-wrap">
+        <span class="verdict-icon">{{ verdictIcon }}</span>
+      </div>
+      <div class="verdict-text">
+        <div class="verdict-label">{{ result.verdict.label }}</div>
+        <div class="verdict-name serif" *ngIf="result.fields.name">
+          {{ result.fields.name }}
+        </div>
+        <div class="verdict-meta">
+          <span *ngIf="result.fields.dob">DOB {{ result.fields.dob }}</span>
+          <span *ngIf="result.fields.gender"> · {{ result.fields.gender }}</span>
+          <span *ngIf="result.fields.address_state"> · {{ result.fields.address_state }}</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Score ring -->
+    <div class="verdict-right">
+      <div class="overall-ring">
+        <svg width="96" height="96" viewBox="0 0 96 96">
+          <circle cx="48" cy="48" r="36"
+                  fill="none" stroke="rgba(255,255,255,0.08)" stroke-width="7"/>
+          <circle cx="48" cy="48" r="36"
+                  fill="none"
+                  [attr.stroke]="ringColor"
+                  stroke-width="7"
+                  stroke-linecap="round"
+                  [attr.stroke-dasharray]="226"
+                  [attr.stroke-dashoffset]="ringDashOffset"
+                  style="transform:rotate(-90deg);transform-origin:50% 50%;
+                         transition:stroke-dashoffset 1.2s cubic-bezier(0.4,0,0.2,1)"/>
+        </svg>
+        <div class="overall-value">
+          <span class="mono" [style.color]="ringColor">{{ overallScore }}</span>
+          <span class="overall-max">/100</span>
+        </div>
+      </div>
+      <div class="overall-label">Overall Score</div>
+    </div>
+  </div>
+
+  <!-- ── Quick chips ──────────────────────────────────────── -->
+  <div class="quick-chips">
+    <span class="qchip"
+          [class.qchip-pass]="(result.qr?.trust_score ?? 0) >= 60"
+          [class.qchip-fail]="(result.qr?.trust_score ?? 0) < 60">
+      QR {{ result.qr?.trust_score ?? 0 }}/100
+    </span>
+    <span class="qchip"
+          [class.qchip-pass]="result.tamper?.passed"
+          [class.qchip-fail]="!result.tamper?.passed">
+      Tamper {{ result.tamper?.score ?? 0 }}/100
+    </span>
+    <span class="qchip"
+          [class.qchip-pass]="result.geo?.passed"
+          [class.qchip-fail]="!result.geo?.passed">
+      Geo {{ result.geo?.score ?? 0 }}/100
+    </span>
+    <span class="qchip"
+          [class.qchip-pass]="(result.face?.quality_score ?? 0) >= 50"
+          [class.qchip-fail]="(result.face?.quality_score ?? 0) < 50">
+      Face {{ result.face?.quality_score ?? 0 }}/100
+    </span>
+    <span class="qchip" *ngIf="totalSignals > 0"
+          [class.qchip-fail]="criticalSignals > 0"
+          [class.qchip-warn]="criticalSignals === 0 && totalSignals > 0">
+      {{ totalSignals }} Signal{{ totalSignals !== 1 ? 's' : '' }}
+    </span>
+    <span class="qchip qchip-pass" *ngIf="totalSignals === 0">
+      ✓ No Signals
+    </span>
+  </div>
+
+  <!-- ── Actions ──────────────────────────────────────────── -->
+  <div class="actions-row">
+    <button class="btn btn-ghost" (click)="reset.emit()">
+      ↩ Verify another card
+    </button>
+    <button class="btn btn-ghost pdf-btn"
+            *ngIf="result.pdf_report_url"
+            (click)="downloadPDF()">
+      <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+        <path d="M7 1v8M4 6l3 3 3-3M2 11h10" stroke="currentColor"
+              stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      Download PDF Report
+    </button>
+    <span class="pdf-hash mono" *ngIf="result.pdf_report_hash">
+      SHA: {{ result.pdf_report_hash }}
+    </span>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════
+       TABS
+  ══════════════════════════════════════════════════════ -->
+  <div class="tabs">
+    <button class="tab" [class.active]="activeTab==='overview'"
+            (click)="activeTab='overview'">Overview</button>
+    <button class="tab" [class.active]="activeTab==='fields'"
+            (click)="activeTab='fields'">Fields & QR</button>
+    <button class="tab" [class.active]="activeTab==='modules'"
+            (click)="activeTab='modules'">Module Scores</button>
+    <button class="tab" [class.active]="activeTab==='signals'"
+            (click)="activeTab='signals'">
+      Fraud Signals
+      <span class="tab-badge" *ngIf="totalSignals">{{ totalSignals }}</span>
+    </button>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════
+       TAB: OVERVIEW
+  ══════════════════════════════════════════════════════ -->
+  <div *ngIf="activeTab === 'overview'" class="tab-content fade-up">
+
+    <!-- Identity quick-view -->
+    <div class="card" style="margin-bottom:16px">
+      <div class="card-title"><span class="dot"></span> Identity</div>
+      <div class="identity-grid">
+        <div class="id-field" *ngFor="let f of identityQuickFields">
+          <div class="id-label">{{ f.label }}</div>
+          <div class="id-value mono">{{ f.value || '—' }}</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Address -->
+    <div class="card" style="margin-bottom:16px">
+      <div class="card-title"><span class="dot"></span> Address</div>
+      <div class="address-line mono">{{ addressQuickFields }}</div>
+      <div class="address-raw" *ngIf="result.fields.address_raw">
+        {{ result.fields.address_raw }}
+      </div>
+    </div>
+
+    <!-- Face AI summary row -->
+    <div class="face-row">
+      <div class="card face-card">
+        <div class="card-title"><span class="dot"></span> Face Quality</div>
+        <div class="face-metric" [style.color]="scoreColor(result.face?.quality_score ?? 0)">
+          {{ result.face?.quality_score ?? '—' }}<span class="face-max">/100</span>
+        </div>
+        <div class="progress-wrap">
+          <div class="progress-fill"
+               [class.green]="(result.face?.quality_score??0) >= 75"
+               [class.yellow]="(result.face?.quality_score??0) >= 50 && (result.face?.quality_score??0) < 75"
+               [class.red]="(result.face?.quality_score??0) < 50"
+               [style.width.%]="result.face?.quality_score ?? 0">
+          </div>
+        </div>
+        <div class="face-sub">{{ result.face?.quality_verdict }}</div>
+      </div>
+
+      <div class="card face-card">
+        <div class="card-title"><span class="dot"></span> Liveness</div>
+        <div class="face-metric"
+             [style.color]="scoreColor(result.face?.combined_liveness_score ?? result.face?.liveness_score ?? 0)">
+          {{ (result.face?.combined_liveness_score ?? result.face?.liveness_score ?? 0) | number:'1.0-0' }}<span class="face-max">/100</span>
+        </div>
+        <div class="progress-wrap">
+          <div class="progress-fill"
+               [class.green]="(result.face?.combined_liveness_score??0) >= 75"
+               [class.yellow]="(result.face?.combined_liveness_score??0) >= 50 && (result.face?.combined_liveness_score??0) < 75"
+               [class.red]="(result.face?.combined_liveness_score??0) < 50"
+               [style.width.%]="result.face?.combined_liveness_score ?? result.face?.liveness_score ?? 0">
+          </div>
+        </div>
+        <div class="face-sub">
+          {{ (result.face?.combined_liveness_real ?? result.face?.likely_real) ? 'Likely real' : 'Suspicious' }}
+        </div>
+      </div>
+
+      <div class="card face-card">
+        <div class="card-title"><span class="dot"></span> Age Check</div>
+        <div class="face-metric"
+             [style.color]="scoreColor(result.face?.age_score ?? 50)">
+          {{ result.face?.age_score ?? '—' }}<span class="face-max">/100</span>
+        </div>
+        <div class="progress-wrap">
+          <div class="progress-fill"
+               [class.green]="(result.face?.age_score??0) >= 75"
+               [class.yellow]="(result.face?.age_score??0) >= 50 && (result.face?.age_score??0) < 75"
+               [class.red]="(result.face?.age_score??0) < 50"
+               [style.width.%]="result.face?.age_score ?? 0">
+          </div>
+        </div>
+        <div class="face-sub">{{ ageInfo || result.face?.age_note || '—' }}</div>
+      </div>
+
+      <div class="card face-card">
+        <div class="card-title"><span class="dot"></span> Selfie Match</div>
+        <div class="face-metric" *ngIf="result.face?.match_result; else noSelfie">
+          {{ result.face!.match_result!.match_score | number:'1.0-0' }}<span class="face-max">/100</span>
+        </div>
+        <ng-template #noSelfie>
+          <div class="face-na">Not provided</div>
+        </ng-template>
+        <div class="face-sub" *ngIf="result.face?.match_result">
+          {{ result.face!.match_result!.verdict }}
+          · {{ result.face!.match_result!.engine }}
+        </div>
+        <div class="face-sub" *ngIf="!result.face?.match_result">
+          Upload selfie to enable biometric match
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════
+       TAB: FIELDS & QR
+  ══════════════════════════════════════════════════════ -->
+  <div *ngIf="activeTab === 'fields'" class="tab-content fade-up">
+    <app-verification-table
+      [fields]="result.fields"
+      [qr]="result.qr"
+    />
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════
+       TAB: MODULE SCORES
+  ══════════════════════════════════════════════════════ -->
+  <div *ngIf="activeTab === 'modules'" class="tab-content fade-up">
+    <div class="score-grid">
+      <app-score-card *ngFor="let card of scoreCards; trackBy: trackByScoreCard" [data]="card" />
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════
+       TAB: FRAUD SIGNALS
+  ══════════════════════════════════════════════════════ -->
+  <div *ngIf="activeTab === 'signals'" class="tab-content fade-up">
+    <app-fraud-signals [explanations]="result.explanations ?? []" />
+  </div>
+
+</div>

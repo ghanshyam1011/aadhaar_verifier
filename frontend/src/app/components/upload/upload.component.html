@@ -1,0 +1,166 @@
+<!-- Upload Section -->
+<div class="upload-page" [class.has-result]="result()">
+
+  <!-- ── Upload Form ─────────────────────────────────────── -->
+  <div class="upload-form" [class.hidden]="result()">
+
+    <!-- Hero -->
+    <div class="hero fade-up fade-up-1">
+      <!-- <div class="hero-eyebrow">UIDAI · AI-Powered · 28 Checks</div> -->
+      <h1><span class="serif" style="font-style:italic">Aadhaar Verification</span></h1>
+      <p class="hero-desc">
+        Upload both sides of the card for maximum confidence.
+        Our system runs OCR, Secure QR decode, face AI, tampering
+        detection, and geographic validation in one pass.
+      </p>
+    </div>
+
+    <div class="upload-grid fade-up fade-up-2">
+
+      <!-- Front Side -->
+      <div class="slot">
+        <div class="slot-header">
+          <span class="section-label">01 · Front Side</span>
+          <span class="badge badge-blue">REQUIRED</span>
+        </div>
+        <div class="drop-zone"
+             [class.has-file]="frontFile()"
+             [class.drag-over]="isDragging()['front']"
+             (dragover)="onDragOver('front', $event)"
+             (dragleave)="onDragLeave('front')"
+             (drop)="onDrop('front', $event)">
+          <input type="file" accept=".jpg,.jpeg,.png,.webp,.bmp"
+                 (change)="onFileSelect('front', $event)" />
+          <div class="drop-hint">
+            <div class="drop-icon">🪪</div>
+            <div class="drop-label">Front of Aadhaar</div>
+            <div class="drop-sub">Name · DOB · Aadhaar No · Face Photo</div>
+            <div class="drop-sub" style="margin-top:6px;font-size:0.68rem">
+              Drag & drop or click · JPG PNG WEBP
+            </div>
+          </div>
+          <img class="drop-preview" [src]="frontPreview()" alt="Front preview" />
+          <button *ngIf="frontFile()" class="remove-btn" (click)="removeFile('front')">✕</button>
+        </div>
+        <div class="slot-meta" *ngIf="frontFile()">
+          <span class="mono">{{ frontFile()!.name }}</span>
+          <span>{{ (frontFile()!.size / 1024).toFixed(0) }} KB</span>
+        </div>
+      </div>
+
+      <!-- Back Side -->
+      <div class="slot">
+        <div class="slot-header">
+          <span class="section-label">02 · Back Side</span>
+          <span class="badge" style="background:var(--bg-elevated);color:var(--text-tertiary);border:1px solid var(--border-dim)">OPTIONAL</span>
+        </div>
+        <div class="drop-zone"
+             [class.has-file]="backFile()"
+             [class.drag-over]="isDragging()['back']"
+             (dragover)="onDragOver('back', $event)"
+             (dragleave)="onDragLeave('back')"
+             (drop)="onDrop('back', $event)">
+          <input type="file" accept=".jpg,.jpeg,.png,.webp,.bmp"
+                 (change)="onFileSelect('back', $event)" />
+          <div class="drop-hint">
+            <div class="drop-icon">🏠</div>
+            <div class="drop-label">Back of Aadhaar</div>
+            <div class="drop-sub">Address · QR Code · Barcode</div>
+            <div class="drop-sub" style="margin-top:6px;font-size:0.68rem;color:var(--green)">
+              Strongly recommended — QR is on the back
+            </div>
+          </div>
+          <img class="drop-preview" [src]="backPreview()" alt="Back preview" />
+          <button *ngIf="backFile()" class="remove-btn" (click)="removeFile('back')">✕</button>
+        </div>
+        <div class="slot-meta" *ngIf="backFile()">
+          <span class="mono">{{ backFile()!.name }}</span>
+          <span>{{ (backFile()!.size / 1024).toFixed(0) }} KB</span>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Selfie Row -->
+    <!-- <div class="selfie-row fade-up fade-up-3">
+      <div class="slot selfie-slot">
+        <div class="slot-header">
+          <span class="section-label">03 · Live Selfie</span>
+          <span class="badge" style="background:var(--bg-elevated);color:var(--text-tertiary);border:1px solid var(--border-dim)">OPTIONAL</span>
+        </div>
+        <div class="drop-zone"
+             [class.has-file]="selfieFile()"
+             [class.drag-over]="isDragging()['selfie']"
+             (dragover)="onDragOver('selfie', $event)"
+             (dragleave)="onDragLeave('selfie')"
+             (drop)="onDrop('selfie', $event)">
+          <input type="file" accept=".jpg,.jpeg,.png,.webp,.bmp"
+                 (change)="onFileSelect('selfie', $event)" />
+          <div class="drop-hint">
+            <div class="drop-icon">🤳</div>
+            <div class="drop-label">Live Selfie</div>
+            <div class="drop-sub">Face match against card photo</div>
+          </div>
+          <img class="drop-preview" [src]="selfiePreview()" alt="Selfie preview" />
+          <button *ngIf="selfieFile()" class="remove-btn" (click)="removeFile('selfie')">✕</button>
+        </div>
+      </div>
+      <div class="selfie-info">
+        <h3>How it works</h3>
+        <ul>
+          <li><span class="check-dot"></span> Front side extracts Name, DOB, Gender, Aadhaar number</li>
+          <li><span class="check-dot"></span> Back side decodes the Secure QR V5 for cross-validation</li>
+          <li><span class="check-dot"></span> Selfie enables InsightFace ArcFace biometric matching</li>
+          <li><span class="check-dot"></span> 28 independent checks across 6 phases run in sequence</li>
+        </ul>
+        <div class="info-chips">
+          <span class="chip">OCR</span>
+          <span class="chip">Secure QR</span>
+          <span class="chip">ELA</span>
+          <span class="chip">Verhoeff</span>
+          <span class="chip">Liveness</span>
+          <span class="chip">Geo</span>
+        </div>
+      </div>
+    </div> -->
+
+    <!-- Error -->
+    <div class="error-banner fade-up" *ngIf="errorMsg()">
+      <span class="error-icon">⚠</span>
+      {{ errorMsg() }}
+    </div>
+
+    <!-- Submit -->
+    <div class="submit-row fade-up fade-up-4">
+      <button class="btn btn-primary submit-btn"
+              [disabled]="!frontFile() || isProcessing()"
+              (click)="submit()">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+          <path d="M8 1L14 8L8 15" stroke="white" stroke-width="1.8"
+                stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M2 8H14" stroke="white" stroke-width="1.8"
+                stroke-linecap="round"/>
+        </svg>
+        Verify Aadhaar Card
+      </button>
+      <span class="submit-note text-dim">Images are deleted immediately after processing</span>
+    </div>
+
+  </div>
+
+  <!-- ── Progress ─────────────────────────────────────────── -->
+  <app-progress-steps
+    *ngIf="isProcessing()"
+    [steps]="steps"
+    [activeIndex]="stepIndex()"
+    [isError]="currentStep() === 'error'"
+  />
+
+  <!-- ── Result ─────────────────────────────────────────────── -->
+  <app-result
+    *ngIf="result()"
+    [result]="result()!"
+    (reset)="reset()"
+  />
+
+</div>
